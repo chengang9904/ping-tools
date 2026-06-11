@@ -20,8 +20,20 @@ v2 新增
    上以醒目的红色 X 标出每次丢包的时刻（不参与 Y 轴自动缩放，无反馈回路）。
 7. 时间范围切换：1分钟 / 5分钟 / 1小时 / 6小时 / 24小时。
    底层为 numpy 预分配环形缓冲区（24h = 86400 点，O(1) 追加），
-   展示长周期时按桶做"峰值降采样"（桶内取最大延迟 = 最坏情况），
-   屏幕上恒定 ≤ MAX_PLOT_POINTS 个点，切换/缩放始终流畅。
+   展示长周期时按桶降采样，屏幕上恒定 ≤ MAX_PLOT_POINTS 个点，
+   切换/缩放始终流畅。
+
+v3 新增
+-------
+8. 抖动（Jitter）列：RFC 3550 定义的指数滑动平均（平滑系数 1/16），
+   O(1) 增量更新。只捕捉相邻样本间的"跳动"——延迟稳定时哪怕绝对值
+   很高，抖动也趋近 0；比标准差更能反映真实的网络波动。
+9. 滚动窗口统计：表格的 P50/P95 基于最近 STATS_WINDOW_SECONDS 秒
+   窗口现算，反映"现在"而非全程累计；P95 替代 max，不会被单次
+   偶发尖刺永久污染。
+10. 均值±包络阴影带：降采样每桶顺便计算 min/mean/max——主线画均值，
+    FillBetweenItem 在 min-max 之间填充半透明色。带子窄 = 稳定，
+    带子突然变宽 = 抖动发作，扫一眼即可定位波动时段。
 
 依赖安装
 --------
@@ -55,6 +67,7 @@ HISTORY_SECONDS  = 24 * 3600                              # 保留 24 小时历�
 RING_CAPACITY    = int(HISTORY_SECONDS / PING_INTERVAL)   # 86400 点
 MAX_PLOT_POINTS  = 1500   # 屏幕上单条曲线最多绘制的点数（降采样目标）
 CONSEC_LOSS_ALERT = 3     # 连续丢包达到该次数 → 托盘气泡告警
+STATS_WINDOW_SECONDS = 60 # 表格 P50/P95 的滚动统计窗口（秒）
 
 # 时间范围选项：(显示文本, 秒数)
 TIME_RANGES = [
@@ -247,55 +260,77 @@ class RingBuffer:
         return t[i:], v[i:]
 
 
-def downsample_peak(t: np.ndarray, v: np.ndarray, max_points: int):
-    """峰值降采样：把 n 个点按桶聚合到 <= max_points 个点。
+def envelope_series(t: np.ndarray, v: np.ndarray, max_points: int):
+    """生成绘图序列：返回 (t_line, v_line, v_lo, v_hi, loss_t) 五元组。
 
-    - 桶内延迟取最大值（保留"最坏情况"尖刺，监控场景比平均值更有意义）
-    - 桶内只要出现过 NaN（丢包），该桶时刻就记入丢包标记
-    - 整桶全为 NaN 时输出 NaN，折线在该处保持断开
-
-    返回 (t_ds, v_ds, loss_t)；loss_t 为需要画红 X 的时刻数组。
+    点数 > max_points 时按桶聚合（降采样）：
+      - v_line = 桶内均值（滚动均值线）
+      - v_lo / v_hi = 桶内 min / max（包络阴影带的上下边界）
+      - 桶内只要出现过 NaN（丢包），该桶时刻就记入 loss_t（红 X 标记）
+      - 整桶全为 NaN 时输出 NaN，折线/包络在该处保持断开
+    点数不多时：v_line = 原始数据，包络带用滑动窗口 min/max 计算，
+      带宽依然直观反映短期波动。
     """
     n = len(t)
     if n == 0:
-        return t, v, _EMPTY
-    if n <= max_points:                      # 点数不多：原样输出，不降采样
-        return t, v, t[np.isnan(v)]
+        return t, v, v, v, _EMPTY
 
-    step = -(-n // max_points)               # 桶宽 = ceil(n / max_points)
+    if n <= max_points:                       # 不降采样：滑动窗口包络
+        loss_t = t[np.isnan(v)]
+        w = min(15, n)                        # 滑动窗口宽度（样本数）
+        if w < 3:
+            return t, v, v, v, loss_t
+        win = np.lib.stride_tricks.sliding_window_view(v, w)
+        valid = ~np.isnan(win)
+        has = valid.any(axis=1)
+        # 用 +inf/-inf 占位无效值，规避 nanmin/nanmax 对全 NaN 窗口的告警
+        lo = np.where(has, np.min(np.where(valid, win, np.inf), axis=1), np.nan)
+        hi = np.where(has, np.max(np.where(valid, win, -np.inf), axis=1), np.nan)
+        # 滑动结果比原序列短 w-1 个点，首尾用边缘值补齐以对齐 t
+        pad_l = (w - 1) // 2
+        pad_r = w - 1 - pad_l
+        v_lo = np.concatenate((np.full(pad_l, lo[0]), lo, np.full(pad_r, lo[-1])))
+        v_hi = np.concatenate((np.full(pad_l, hi[0]), hi, np.full(pad_r, hi[-1])))
+        return t, v, v_lo, v_hi, loss_t
+
+    step = -(-n // max_points)                # 桶宽 = ceil(n / max_points)
     m = (n // step) * step
     # 为对齐 reshape 丢弃最旧的 n-m 个零头点（最多 step-1 个，影响可忽略）
     t2 = t[n - m:].reshape(-1, step)
     v2 = v[n - m:].reshape(-1, step)
 
     valid = ~np.isnan(v2)
-    has_valid = valid.any(axis=1)
-    # 用 -inf 占位无效值再取 max，避免 np.nanmax 对全 NaN 桶发出告警
-    peak = np.max(np.where(valid, v2, -np.inf), axis=1)
-    v_ds = np.where(has_valid, peak, np.nan)
+    has = valid.any(axis=1)
+    cnt = np.maximum(valid.sum(axis=1), 1)
+    v_line = np.where(has, np.where(valid, v2, 0.0).sum(axis=1) / cnt, np.nan)
+    v_lo = np.where(has, np.min(np.where(valid, v2, np.inf), axis=1), np.nan)
+    v_hi = np.where(has, np.max(np.where(valid, v2, -np.inf), axis=1), np.nan)
     t_ds = t2[:, 0]
-    loss_t = t_ds[~valid.all(axis=1)]         # 桶内有任何丢包 → 标记
-    return t_ds, v_ds, loss_t
+    loss_t = t_ds[~valid.all(axis=1)]          # 桶内有任何丢包 → 标记
+    return t_ds, v_line, v_lo, v_hi, loss_t
 
 
 # ========================= 统计模型 =========================
 
 
 class TargetStats:
-    """单目标的累计统计。增量更新，O(1)，不保存全量历史。"""
+    """单目标的累计计数 + RFC 3550 抖动。增量更新，O(1)。
 
-    __slots__ = ("sent", "lost", "recv", "rtt_min", "rtt_max", "rtt_sum",
-                 "last", "consec_loss")
+    延迟分布指标（P50/P95）不在此累计——refresh_ui 每次刷新基于最近
+    STATS_WINDOW_SECONDS 秒的环形缓冲窗口现算，保证反映"现在"。
+    """
+
+    __slots__ = ("sent", "lost", "recv", "last", "consec_loss",
+                 "prev_rtt", "jitter")
 
     def __init__(self):
         self.sent = 0
         self.lost = 0
         self.recv = 0
-        self.rtt_min = math.inf
-        self.rtt_max = 0.0
-        self.rtt_sum = 0.0
         self.last = None        # 最近一次 RTT；None 表示最近一次超时
         self.consec_loss = 0    # 当前连续丢包次数（用于托盘告警）
+        self.prev_rtt = None    # 上一次成功的 RTT（抖动计算用）
+        self.jitter = 0.0       # RFC 3550 指数滑动平均抖动（ms）
 
     def update(self, rtt):
         self.sent += 1
@@ -306,27 +341,27 @@ class TargetStats:
         else:
             self.recv += 1
             self.consec_loss = 0
-            self.rtt_min = min(self.rtt_min, rtt)
-            self.rtt_max = max(self.rtt_max, rtt)
-            self.rtt_sum += rtt
             self.last = rtt
+            # RFC 3550 抖动：相邻两次成功 RTT 差值的指数滑动平均，
+            # 1/16 为 RFC 推荐平滑系数。只捕捉"跳动"——延迟稳定在
+            # 200ms 时抖动趋近 0，比标准差更能反映真实波动。
+            if self.prev_rtt is not None:
+                diff = abs(rtt - self.prev_rtt)
+                self.jitter += (diff - self.jitter) / 16.0
+            self.prev_rtt = rtt
 
     @property
     def loss_rate(self):
         return (self.lost / self.sent * 100.0) if self.sent else 0.0
 
-    @property
-    def avg(self):
-        return (self.rtt_sum / self.recv) if self.recv else None
-
 
 # ========================= 主窗口 =========================
 
 COL_TARGET, COL_STATUS, COL_SENT, COL_LOST, COL_LOSS, \
-    COL_CUR, COL_MIN, COL_MAX, COL_AVG = range(9)
+    COL_CUR, COL_P50, COL_P95, COL_JITTER = range(9)
 
 TABLE_HEADERS = ["目标", "状态", "发送", "丢失", "丢包率",
-                 "当前(ms)", "最小(ms)", "最大(ms)", "平均(ms)"]
+                 "当前(ms)", "P50(ms)", "P95(ms)", "抖动(ms)"]
 
 
 def make_app_icon() -> QtGui.QIcon:
@@ -487,6 +522,16 @@ class MainWindow(QtWidgets.QMainWindow):
             [], [], pen=pg.mkPen(color=color, width=2),
             name=target, connect="finite",   # NaN 处断线，直观呈现丢包
         )
+        # 包络阴影带：min-max 之间填充同色半透明——带宽即波动幅度，
+        # 带子突然变宽 = 抖动发作。上下边界曲线本身不可见（pen=None）。
+        band_lo = pg.PlotDataItem([], [], pen=None, connect="finite")
+        band_hi = pg.PlotDataItem([], [], pen=None, connect="finite")
+        band = pg.FillBetweenItem(band_lo, band_hi,
+                                  brush=pg.mkBrush(color + (45,)))
+        band.setZValue(-10)                  # 垫在所有折线下方
+        self.plot.addItem(band_lo)
+        self.plot.addItem(band_hi)
+        self.plot.addItem(band)
         # 丢包标记：红色 X，挂在图表顶部"丢包带"上。
         # ignoreBounds=True → 不参与 Y 轴自动缩放，避免"标记抬高量程→
         # 标记位置又随量程上移"的正反馈循环。
@@ -508,6 +553,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "stats": TargetStats(),
             "buffer": RingBuffer(RING_CAPACITY),  # 24h 环形缓冲
             "curve": curve,
+            "band_lo": band_lo,
+            "band_hi": band_hi,
+            "band": band,
             "scatter": scatter,
             "color": color,
             "error": None,
@@ -530,6 +578,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._stop_worker_obj(info)
         self.plot.removeItem(info["curve"])
+        self.plot.removeItem(info["band"])
+        self.plot.removeItem(info["band_lo"])
+        self.plot.removeItem(info["band_hi"])
         self.plot.plotItem.vb.removeItem(info["scatter"])
         legend = self.plot.plotItem.legend
         if legend is not None:
@@ -634,10 +685,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if info is None:
                 continue
 
-            # 1) 取窗口数据 → 峰值降采样 → 一次性 setData
+            # 1) 取窗口数据 → 均值线 + min/max 包络降采样 → 一次性 setData
             ts, vs = info["buffer"].window(t_min)
-            ts, vs, loss_t = downsample_peak(ts, vs, MAX_PLOT_POINTS)
-            info["curve"].setData(ts, vs, connect="finite")
+            t_line, v_line, v_lo, v_hi, loss_t = envelope_series(
+                ts, vs, MAX_PLOT_POINTS)
+            info["curve"].setData(t_line, v_line, connect="finite")
+            info["band_lo"].setData(t_line, v_lo, connect="finite")
+            info["band_hi"].setData(t_line, v_hi, connect="finite")
             if len(loss_t):
                 y_band = y_hi - band * (row + 1)
                 info["scatter"].setData(
@@ -668,12 +722,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_cell(row, COL_LOSS, f"{loss:.1f}%", loss_color)
             self._set_cell(row, COL_CUR,
                            "超时" if st.last is None else f"{st.last:.0f}")
-            self._set_cell(row, COL_MIN,
-                           "-" if st.recv == 0 else f"{st.rtt_min:.0f}")
-            self._set_cell(row, COL_MAX,
-                           "-" if st.recv == 0 else f"{st.rtt_max:.0f}")
-            self._set_cell(row, COL_AVG,
-                           "-" if st.avg is None else f"{st.avg:.1f}")
+
+            # P50/P95：基于最近 STATS_WINDOW_SECONDS 秒的滚动窗口现算，
+            # 反映"现在"的延迟分布，不被启动以来的历史数据稀释。
+            wt, wv = info["buffer"].window(t_now - STATS_WINDOW_SECONDS)
+            valid = wv[~np.isnan(wv)]
+            if valid.size:
+                self._set_cell(row, COL_P50, f"{np.percentile(valid, 50):.0f}")
+                self._set_cell(row, COL_P95, f"{np.percentile(valid, 95):.0f}")
+            else:
+                self._set_cell(row, COL_P50, "-")
+                self._set_cell(row, COL_P95, "-")
+
+            # 抖动：<5ms 绿 / <20ms 黄 / 其余红
+            if st.recv >= 2:
+                j = st.jitter
+                j_color = ("#30d060" if j < 5 else
+                           "#ffc83c" if j < 20 else "#ff5050")
+                self._set_cell(row, COL_JITTER, f"{j:.1f}", j_color)
+            else:
+                self._set_cell(row, COL_JITTER, "-")
 
     def _set_cell(self, row: int, col: int, text: str, color: str = None):
         item = self.table.item(row, col)
