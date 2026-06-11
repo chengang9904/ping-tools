@@ -56,13 +56,25 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           $asset = "PingMonitor-${{ github.ref_name }}-win64.zip"
-          $viewError = gh release view $tag 2>&1
-          $viewExit = $LASTEXITCODE
-          if ($viewExit -eq 0) {
+          $headers = @{
+            Authorization          = ("Bearer " + $env:GH_TOKEN)
+            Accept                 = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $lookupUrl = "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag"
+          $releaseExists = $false
+          try {
+            Invoke-RestMethod -Uri $lookupUrl -Headers $headers -Method Get | Out-Null
+            $releaseExists = $true
+          } catch {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            if ($statusCode -ne 404) {
+              Write-Error "Failed to check release '$tag' (HTTP $statusCode). Verify GH_TOKEN permissions. Details: $($_.Exception.Message)"
+              exit 1
+            }
+          }
+          if ($releaseExists) {
             gh release upload $tag $asset --clobber
-          } elseif ($viewError -match "404|release not found") {
-            gh release create $tag $asset --generate-notes
           } else {
-            Write-Error "Failed to check release '$tag'. Verify GH_TOKEN permissions and gh CLI access. Details: $viewError"
-            exit 1
+            gh release create $tag $asset --generate-notes
           }
