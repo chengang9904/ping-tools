@@ -51,7 +51,17 @@ jobs:
       # 标签触发时：创建 GitHub Release，自动生成更新日志并附上 zip
       - name: Create GitHub Release
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
-        uses: softprops/action-gh-release@v2
-        with:
-          files: PingMonitor-*.zip
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $asset = "PingMonitor-${{ github.ref_name }}-win64.zip"
+          $viewOut = gh release view "$tag" --repo "${{ github.repository }}" 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "$tag" "$asset" --repo "${{ github.repository }}" --clobber
+          } elseif ($viewOut -match 'release.*not found') {
+            gh release create "$tag" "$asset" --repo "${{ github.repository }}" --generate-notes
+          } else {
+            Write-Error "gh release view failed: $viewOut"
+            exit 1
+          }
