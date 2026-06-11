@@ -25,12 +25,12 @@ v2 新增
 
 v3 新增
 -------
-8. 抖动（Jitter）列：RFC 3550 定义的指数滑动平均（平滑系数 1/16），
-   O(1) 增量更新。只捕捉相邻样本间的"跳动"——延迟稳定时哪怕绝对值
-   很高，抖动也趋近 0；比标准差更能反映真实的网络波动。
-9. 滚动窗口统计：表格的 P50/P95 基于最近 STATS_WINDOW_SECONDS 秒
-   窗口现算，反映"现在"而非全程累计；P95 替代 max，不会被单次
-   偶发尖刺永久污染。
+8. 抖动（Jitter）列：选区内相邻成功样本差值的绝对值均值。只捕捉
+   相邻样本间的"跳动"——延迟稳定时哪怕绝对值很高，抖动也趋近 0；
+   比标准差更能反映真实的网络波动。
+9. 选区统计：表格的丢包率/P50/P95/抖动按图表当前可见 X 范围现算
+   （范围变化 150ms 防抖），拖动/缩放图表即联动；P95 替代 max，
+   不会被单次偶发尖刺永久污染。累计"发送/丢失(率)"合并为最后一列。
 10. 均值±包络阴影带：降采样每桶顺便计算 min/mean/max——主线画均值，
     FillBetweenItem 在 min-max 之间填充半透明色。带子窄 = 稳定，
     带子突然变宽 = 抖动发作，扫一眼即可定位波动时段。
@@ -52,6 +52,11 @@ v4 新增
     键（表格行经 UserRole 关联），别名只影响展示层。config.json 的
     targets 升级为 [{"host", "alias"}] 对象数组，兼容读取旧版纯字符串
     格式并在写回时自动迁移。
+15. 真实时间轴 + 自由浏览：横轴为墙钟时间（DateAxisItem，数据 x 为
+    Unix 时间戳，由 monotonic 推导避免系统调时跳变）。拖动/缩放即进入
+    手动浏览模式（停止自动跟随），"跟随最新"按钮或把视图拖回最右缘
+    可恢复跟随；时间范围下拉框 = 跟随模式的窗口宽度。绘图与表格统计
+    都只针对当前可见 X 范围计算。
 
 依赖安装
 --------
@@ -88,11 +93,11 @@ HISTORY_SECONDS  = 24 * 3600                              # 保留 24 小时历�
 RING_CAPACITY    = int(HISTORY_SECONDS / PING_INTERVAL)   # 86400 点
 MAX_PLOT_POINTS  = 1500   # 屏幕上单条曲线最多绘制的点数（降采样目标）
 CONSEC_LOSS_ALERT = 3     # 连续丢包达到该次数 → 托盘气泡告警
-STATS_WINDOW_SECONDS = 60 # 表格 P50/P95 的滚动统计窗口（秒）
+STATS_DEBOUNCE_MS = 150   # 视图范围变化 -> 选区统计重算的防抖间隔
 
-# 时间范围选项：(显示文本, 秒数)
+# 时间范围选项（跟随模式下的窗口宽度）：(显示文本, 秒数)
 TIME_RANGES = [
-    ("实时（最近1分钟）", 60),
+    ("1 分钟",           60),
     ("5 分钟",           300),
     ("1 小时",           3600),
     ("6 小时",           21600),
@@ -400,14 +405,13 @@ def envelope_series(t: np.ndarray, v: np.ndarray, max_points: int):
 
 
 class TargetStats:
-    """单目标的累计计数 + RFC 3550 抖动。增量更新，O(1)。
+    """单目标的累计计数。增量更新，O(1)。
 
-    延迟分布指标（P50/P95）不在此累计——refresh_ui 每次刷新基于最近
-    STATS_WINDOW_SECONDS 秒的环形缓冲窗口现算，保证反映"现在"。
+    延迟分布/抖动等指标不在此累计——表格刷新时基于图表当前可见
+    X 范围的环形缓冲数据现算（选区统计），此处只保留全程汇总。
     """
 
-    __slots__ = ("sent", "lost", "recv", "last", "consec_loss",
-                 "prev_rtt", "jitter")
+    __slots__ = ("sent", "lost", "recv", "last", "consec_loss")
 
     def __init__(self):
         self.sent = 0
@@ -415,8 +419,6 @@ class TargetStats:
         self.recv = 0
         self.last = None        # 最近一次 RTT；None 表示最近一次超时
         self.consec_loss = 0    # 当前连续丢包次数（用于托盘告警）
-        self.prev_rtt = None    # 上一次成功的 RTT（抖动计算用）
-        self.jitter = 0.0       # RFC 3550 指数滑动平均抖动（ms）
 
     def update(self, rtt):
         self.sent += 1
@@ -428,13 +430,6 @@ class TargetStats:
             self.recv += 1
             self.consec_loss = 0
             self.last = rtt
-            # RFC 3550 抖动：相邻两次成功 RTT 差值的指数滑动平均，
-            # 1/16 为 RFC 推荐平滑系数。只捕捉"跳动"——延迟稳定在
-            # 200ms 时抖动趋近 0，比标准差更能反映真实波动。
-            if self.prev_rtt is not None:
-                diff = abs(rtt - self.prev_rtt)
-                self.jitter += (diff - self.jitter) / 16.0
-            self.prev_rtt = rtt
 
     @property
     def loss_rate(self):
@@ -443,11 +438,13 @@ class TargetStats:
 
 # ========================= 主窗口 =========================
 
-COL_TARGET, COL_STATUS, COL_SENT, COL_LOST, COL_LOSS, \
-    COL_CUR, COL_P50, COL_P95, COL_JITTER = range(9)
+COL_TARGET, COL_STATUS, COL_CUR, COL_LOSS, \
+    COL_P50, COL_P95, COL_JITTER, COL_TOTAL = range(8)
 
-TABLE_HEADERS = ["目标", "状态", "发送", "丢失", "丢包率",
-                 "当前(ms)", "P50(ms)", "P95(ms)", "抖动(ms)"]
+# 丢包率/P50/P95/抖动均按图表当前可见 X 范围（选区）现算；
+# 全程汇总后置到最后一列
+TABLE_HEADERS = ["目标", "状态", "当前(ms)", "丢包率(选区)",
+                 "P50(选区)", "P95(选区)", "抖动(选区)", "累计 发送/丢失"]
 
 
 def make_app_icon() -> QtGui.QIcon:
@@ -486,6 +483,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wall_start = time.time()   # 运行秒数 -> 墙钟时间的换算基准
         self.running = True
         self.range_secs = TIME_RANGES[0][1]
+        self.follow = True            # True=X 轴自动跟随最新; False=手动浏览
+        self._setting_range = False   # 程序触发 setXRange 的标志位
         self._tray_tip_shown = False  # "已最小化到托盘"提示只弹一次
 
         self._build_ui()
@@ -508,6 +507,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_timer = QtCore.QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_ui)
         self.refresh_timer.start(REFRESH_MS)
+
+        # 视图 X 范围变化 -> 选区统计重算（防抖，拖动时不高频重算）
+        self._stats_debounce = QtCore.QTimer(self)
+        self._stats_debounce.setSingleShot(True)
+        self._stats_debounce.setInterval(STATS_DEBOUNCE_MS)
+        self._stats_debounce.timeout.connect(self.refresh_ui)
+        # 信号在初始布局/添加目标全部完成后再接，避免启动期的
+        # 自动范围调整被误判为用户操作
+        self.plot.plotItem.vb.sigXRangeChanged.connect(
+            self._on_x_range_changed)
+        self.refresh_ui()   # 立即建立跟随窗口，不等首个定时周期
 
     # ---------------- UI 构建 ----------------
 
@@ -534,6 +544,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.range_combo.addItem(label, secs)
         self.range_combo.currentIndexChanged.connect(self._on_range_changed)
         bar.addWidget(self.range_combo)
+        # 跟随最新：选中=X 轴自动滚动；拖动/缩放图表自动退出跟随
+        self.btn_follow = QtWidgets.QPushButton("跟随最新")
+        self.btn_follow.setCheckable(True)
+        self.btn_follow.setChecked(True)
+        self.btn_follow.clicked.connect(self._on_follow_clicked)
+        bar.addWidget(self.btn_follow)
         bar.addStretch(1)
         layout.addLayout(bar)
 
@@ -556,16 +572,19 @@ class MainWindow(QtWidgets.QMainWindow):
             + self.table.verticalHeader().defaultSectionSize()
             + 2 * self.table.frameWidth())
 
-        # 实时折线图
+        # 实时折线图：横轴为真实墙钟时间（x 数据 = Unix 时间戳）
         pg.setConfigOptions(antialias=True)
-        self.plot = pg.PlotWidget()
+        self.plot = pg.PlotWidget(axisItems={"bottom": pg.DateAxisItem()})
         self.plot.setBackground("#101418")
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("left", "延迟", units="ms")
-        self.plot.setLabel("bottom", "运行时间", units="s")
+        self.plot.setLabel("bottom", "时间")
         self.plot.addLegend(offset=(10, 10))
-        self.plot.setMouseEnabled(x=True, y=True)
+        # 鼠标只控制 X（平移/缩放）；Y 始终按可见数据自动适配，
+        # 避免滚轮缩放后 Y 轴卡死在手动量程
+        self.plot.setMouseEnabled(x=True, y=False)
         self.plot.enableAutoRange(axis="y")
+        self.plot.plotItem.vb.setAutoVisible(y=True)
         self.plot.setMinimumHeight(200)
 
         # 表格/图表用垂直分隔条组装：高度比例可拖动调整，
@@ -768,8 +787,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         st = info["stats"]
         st.update(rtt)
-        elapsed = ts - self.start_time
-        info["buffer"].append(elapsed, rtt if rtt is not None else math.nan)
+        # x 轴全链路使用 Unix 时间戳；由 monotonic 推导（wall_start +
+        # 运行秒数），运行期间系统调时/NTP 跳变不会打乱数据单调性
+        wall_ts = self.wall_start + (ts - self.start_time)
+        info["buffer"].append(wall_ts, rtt if rtt is not None else math.nan)
 
         # 连续丢包恰好达到阈值时告警一次；恢复后 consec 归零，可再次触发
         if (rtt is None and st.consec_loss == CONSEC_LOSS_ALERT
@@ -853,8 +874,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self._persist_targets()
 
     def _on_range_changed(self, _index: int):
+        # 下拉框语义 = 跟随模式下的窗口宽度；切换时同时恢复跟随
         self.range_secs = self.range_combo.currentData()
+        self._set_follow(True)
         self.refresh_ui()   # 立即按新窗口重绘，不等下一个定时器周期
+
+    def _on_follow_clicked(self):
+        self._set_follow(True)   # 点击总是恢复跟随并跳到最新
+        self.refresh_ui()
+
+    def _set_follow(self, follow: bool):
+        self.follow = follow
+        self.btn_follow.setChecked(follow)
+
+    def _latest_ts(self) -> float:
+        """当前时刻的 Unix 时间戳（monotonic 推导，与数据同源）。"""
+        return self.wall_start + (time.monotonic() - self.start_time)
+
+    def _on_x_range_changed(self, _vb, xrange):
+        if self._setting_range:
+            return               # 程序触发（跟随滚动），忽略
+        # 用户拖动/缩放：右缘贴近最新数据 -> 恢复跟随；否则手动浏览
+        x0, x1 = xrange
+        near_edge = x1 >= self._latest_ts() - 0.02 * max(x1 - x0, 1.0)
+        self._set_follow(near_edge)
+        self._stats_debounce.start()   # 防抖重算选区统计与重绘
 
     def toggle_running(self):
         """开始/暂停监控——主界面按钮与托盘菜单共用。"""
@@ -924,10 +968,11 @@ class MainWindow(QtWidgets.QMainWindow):
                          info["color"], wv[i]))
 
         sx = x if snap_x is None else snap_x
-        wall = time.strftime("%H:%M:%S", time.localtime(self.wall_start + sx))
+        # sx 即 Unix 时间戳；运行时长 = 时间戳 - 启动基准
+        wall = time.strftime("%H:%M:%S", time.localtime(sx))
         lines = [
             f"<b>{wall}</b>&nbsp;<span style='color:#9aa4ad'>"
-            f"(运行 {self._fmt_duration(sx)})</span>",
+            f"(运行 {self._fmt_duration(sx - self.wall_start)})</span>",
             f"<span style='color:#9aa4ad'>光标: {y:.1f} ms</span>",
         ]
         for name, color, v in rows:
@@ -953,25 +998,40 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------- 周期刷新 ----------------
 
     def refresh_ui(self):
-        t_now = time.monotonic() - self.start_time
-        t_min = max(0.0, t_now - self.range_secs)
-        # X 轴跟随所选时间窗口滚动
-        self.plot.setXRange(t_min, max(t_now, t_min + 1.0), padding=0.02)
+        """周期刷新（500ms）/ 防抖回调：跟随滚动 X 窗口 -> 重绘可见区 ->
+        按可见 X 范围重算选区统计。"""
+        if self.follow:
+            t_latest = self._latest_ts()
+            self._set_x_range(t_latest - self.range_secs, t_latest)
+        self._refresh_plot()
+        self._refresh_table_stats()
 
+    def _set_x_range(self, x0: float, x1: float):
+        """程序触发的 X 范围设置：置标志位以便范围信号区分用户操作。"""
+        self._setting_range = True
+        try:
+            self.plot.setXRange(x0, x1, padding=0.02)
+        finally:
+            self._setting_range = False
+
+    def _refresh_plot(self):
+        """重绘当前可见 X 范围：取数 -> 包络降采样 -> setData。"""
+        vb = self.plot.plotItem.vb
+        x0, x1 = vb.viewRange()[0]
         # 丢包标记画在当前视野顶部的"丢包带"上，多目标按行错开避免重叠
-        y_lo, y_hi = self.plot.plotItem.vb.viewRange()[1]
+        y_lo, y_hi = vb.viewRange()[1]
         band = (y_hi - y_lo) * 0.045 or 1.0
 
         for row in range(self.table.rowCount()):
-            target = self._row_host(row)
-            info = self.targets.get(target)
+            info = self.targets.get(self._row_host(row))
             if info is None:
                 continue
-
-            # 1) 取窗口数据 → 均值线 + min/max 包络降采样 → 一次性 setData
-            ts, vs = info["buffer"].window(t_min)
-            # 缓存原始（未降采样）窗口数组，十字光标在其上二分查找，
-            # 避免每次鼠标移动都重新拼接环形缓冲
+            # 可见范围裁剪：window() 取左界，searchsorted 截右界
+            ts, vs = info["buffer"].window(x0)
+            j = int(np.searchsorted(ts, x1, side="right"))
+            ts, vs = ts[:j], vs[:j]
+            # 缓存原始（未降采样）可见数组：十字光标二分查找 +
+            # 选区统计共用，避免重复拼接环形缓冲
             info["win_t"], info["win_v"] = ts, vs
             t_line, v_line, v_lo, v_hi, loss_t = envelope_series(
                 ts, vs, MAX_PLOT_POINTS)
@@ -985,7 +1045,12 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 info["scatter"].setData(x=_EMPTY, y=_EMPTY)
 
-            # 2) 表格统计
+    def _refresh_table_stats(self):
+        """表格统计：丢包率/P50/P95/抖动按可见选区现算，累计后置最后一列。"""
+        for row in range(self.table.rowCount()):
+            info = self.targets.get(self._row_host(row))
+            if info is None:
+                continue
             st = info["stats"]
             if info["error"]:
                 self._set_cell(row, COL_STATUS, "错误", "#ff5050")
@@ -999,35 +1064,42 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._set_cell(row, COL_STATUS, "超时", "#ff5050")
             else:
                 self._set_cell(row, COL_STATUS, "正常", "#30d060")
-
-            loss = st.loss_rate
-            loss_color = ("#30d060" if loss < 1 else
-                          "#ffc83c" if loss < 10 else "#ff5050")
-            self._set_cell(row, COL_SENT, str(st.sent))
-            self._set_cell(row, COL_LOST, str(st.lost))
-            self._set_cell(row, COL_LOSS, f"{loss:.1f}%", loss_color)
             self._set_cell(row, COL_CUR,
                            "超时" if st.last is None else f"{st.last:.0f}")
 
-            # P50/P95：基于最近 STATS_WINDOW_SECONDS 秒的滚动窗口现算，
-            # 反映"现在"的延迟分布，不被启动以来的历史数据稀释。
-            wt, wv = info["buffer"].window(t_now - STATS_WINDOW_SECONDS)
-            valid = wv[~np.isnan(wv)]
-            if valid.size:
-                self._set_cell(row, COL_P50, f"{np.percentile(valid, 50):.0f}")
-                self._set_cell(row, COL_P95, f"{np.percentile(valid, 95):.0f}")
+            # —— 选区统计：_refresh_plot 缓存的可见数组 ——
+            wv = info.get("win_v")
+            n = 0 if wv is None else len(wv)
+            if n == 0:
+                for col in (COL_LOSS, COL_P50, COL_P95, COL_JITTER):
+                    self._set_cell(row, col, "-")
             else:
-                self._set_cell(row, COL_P50, "-")
-                self._set_cell(row, COL_P95, "-")
+                lost = int(np.isnan(wv).sum())
+                loss = lost / n * 100.0
+                loss_color = ("#30d060" if loss < 1 else
+                              "#ffc83c" if loss < 10 else "#ff5050")
+                self._set_cell(row, COL_LOSS, f"{loss:.1f}%", loss_color)
+                valid = wv[~np.isnan(wv)]
+                if valid.size:
+                    self._set_cell(row, COL_P50,
+                                   f"{np.percentile(valid, 50):.0f}")
+                    self._set_cell(row, COL_P95,
+                                   f"{np.percentile(valid, 95):.0f}")
+                else:
+                    self._set_cell(row, COL_P50, "-")
+                    self._set_cell(row, COL_P95, "-")
+                # 选区抖动 = 相邻成功样本差值绝对值的均值
+                if valid.size >= 2:
+                    jit = float(np.mean(np.abs(np.diff(valid))))
+                    j_color = ("#30d060" if jit < 5 else
+                               "#ffc83c" if jit < 20 else "#ff5050")
+                    self._set_cell(row, COL_JITTER, f"{jit:.1f}", j_color)
+                else:
+                    self._set_cell(row, COL_JITTER, "-")
 
-            # 抖动：<5ms 绿 / <20ms 黄 / 其余红
-            if st.recv >= 2:
-                j = st.jitter
-                j_color = ("#30d060" if j < 5 else
-                           "#ffc83c" if j < 20 else "#ff5050")
-                self._set_cell(row, COL_JITTER, f"{j:.1f}", j_color)
-            else:
-                self._set_cell(row, COL_JITTER, "-")
+            # —— 全程汇总（最后一列）——
+            self._set_cell(row, COL_TOTAL,
+                           f"{st.sent}/{st.lost} ({st.loss_rate:.1f}%)")
 
     def _set_cell(self, row: int, col: int, text: str, color: str = None):
         item = self.table.item(row, col)
