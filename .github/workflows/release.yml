@@ -56,8 +56,9 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           $asset = "PingMonitor-${{ github.ref_name }}-win64.zip"
-          $viewError = gh release view $tag 1> $null 2>&1
-          if ($LASTEXITCODE -eq 0) {
+          $viewError = gh release view $tag 2>&1
+          $viewExit = $LASTEXITCODE
+          if ($viewExit -eq 0) {
             gh release upload $tag $asset --clobber
           } elseif ($viewError -match "404|release not found") {
             gh release create $tag $asset --generate-notes
