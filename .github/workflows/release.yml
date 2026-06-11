@@ -63,6 +63,6 @@ jobs:
           } elseif ($viewError -match "404|release not found") {
             gh release create $tag $asset --generate-notes
           } else {
-            Write-Error "Failed to check release '$tag': $viewError"
+            Write-Error "Failed to check release '$tag'. Verify GH_TOKEN permissions and gh CLI access. Details: $viewError"
             exit 1
           }
