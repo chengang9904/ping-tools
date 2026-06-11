@@ -56,9 +56,9 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           $asset = "PingMonitor-${{ github.ref_name }}-win64.zip"
-          gh release view $tag --repo "${{ github.repository }}" *> $null
+          gh release view $tag --repo "${{ github.repository }}" > $null 2>&1
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $asset --clobber
+            gh release upload $tag $asset --repo "${{ github.repository }}" --clobber
           } else {
-            gh release create $tag $asset --generate-notes
+            gh release create $tag $asset --repo "${{ github.repository }}" --generate-notes
           }
