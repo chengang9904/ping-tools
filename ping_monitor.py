@@ -36,6 +36,11 @@ v3 新增
     带子突然变宽 = 抖动发作，扫一眼即可定位波动时段。
 11. 目标列表持久化：保存于 %APPDATA%\\PingMonitor\\config.json，
     添加/移除目标即原子写回，重启自动恢复；配置损坏时回退默认列表。
+12. TradingView 风格十字光标：虚线十字线跟随鼠标，竖线吸附到最近
+    采样时刻；悬浮信息窗显示该时刻的墙钟时间/运行时长/光标延迟，
+    以及每个目标在该时刻的 RTT（丢包以红色标出），靠近视图边缘时
+    自动翻转停靠方向。基于 refresh_ui 缓存的窗口数组做二分查找，
+    鼠标事件处理为 O(log n)，不影响绘图性能。
 
 依赖安装
 --------
@@ -444,6 +449,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # target -> {worker, stats, buffer, curve, scatter, color, error}
         self.targets = {}
         self.start_time = time.monotonic()
+        self.wall_start = time.time()   # 运行秒数 -> 墙钟时间的换算基准
         self.running = True
         self.range_secs = TIME_RANGES[0][1]
         self._tray_tip_shown = False  # "已最小化到托盘"提示只弹一次
@@ -513,6 +519,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.setMouseEnabled(x=True, y=True)
         self.plot.enableAutoRange(axis="y")
         layout.addWidget(self.plot, stretch=1)
+
+        # —— TradingView 风格十字光标 + 悬浮信息窗 ——
+        cross_pen = pg.mkPen((168, 176, 184, 150), style=QtCore.Qt.DashLine)
+        self.vline = pg.InfiniteLine(angle=90, movable=False, pen=cross_pen)
+        self.hline = pg.InfiniteLine(angle=0, movable=False, pen=cross_pen)
+        self.hover_text = pg.TextItem(
+            html="", anchor=(0, 0),
+            fill=pg.mkBrush(16, 20, 24, 235),
+            border=pg.mkPen((96, 105, 114)),
+        )
+        vb = self.plot.plotItem.vb
+        for item in (self.vline, self.hline, self.hover_text):
+            item.setZValue(100)               # 盖在所有曲线/标记之上
+            item.setVisible(False)
+            vb.addItem(item, ignoreBounds=True)  # 不参与自动缩放
+        self._hover_timer = QtCore.QElapsedTimer()  # 高频鼠标事件节流
+        self._hover_timer.start()
+        self.plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
+        self.plot.viewport().installEventFilter(self)  # 鼠标移出图表时隐藏
 
     # ---------------- 系统托盘 ----------------
 
@@ -718,6 +743,80 @@ class MainWindow(QtWidgets.QMainWindow):
                 "PingMonitor - 网络监控运行中" if self.running
                 else "PingMonitor - 监控已暂停")
 
+    # ---------------- 十字光标 + 悬浮信息窗 ----------------
+
+    def eventFilter(self, obj, event):
+        # 鼠标离开图表区域时隐藏十字线（sigMouseMoved 不会在离开时触发）
+        if obj is self.plot.viewport() and event.type() == QtCore.QEvent.Leave:
+            self._set_crosshair_visible(False)
+        return super().eventFilter(obj, event)
+
+    def _set_crosshair_visible(self, visible: bool):
+        self.vline.setVisible(visible)
+        self.hline.setVisible(visible)
+        self.hover_text.setVisible(visible)
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        s = max(0, int(seconds))
+        return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+    def _on_mouse_moved(self, scene_pos):
+        vb = self.plot.plotItem.vb
+        if not vb.sceneBoundingRect().contains(scene_pos):
+            self._set_crosshair_visible(False)
+            return
+        # 节流：鼠标事件可达数百 Hz，30ms 一次足够流畅
+        if self._hover_timer.elapsed() < 30:
+            return
+        self._hover_timer.restart()
+
+        pt = vb.mapSceneToView(scene_pos)
+        x, y = pt.x(), pt.y()
+
+        # 对每个目标在缓存的窗口数组上二分查找最近采样点（O(log n)）
+        snap_x = None
+        rows = []
+        for target, info in self.targets.items():
+            wt, wv = info.get("win_t"), info.get("win_v")
+            if wt is None or len(wt) == 0:
+                continue
+            i = int(np.searchsorted(wt, x))
+            if i >= len(wt):
+                i = len(wt) - 1
+            elif i > 0 and (x - wt[i - 1]) < (wt[i] - x):
+                i -= 1
+            if snap_x is None:
+                snap_x = wt[i]            # 竖线吸附到最近采样时刻
+            rows.append((target, info["color"], wv[i]))
+
+        sx = x if snap_x is None else snap_x
+        wall = time.strftime("%H:%M:%S", time.localtime(self.wall_start + sx))
+        lines = [
+            f"<b>{wall}</b>&nbsp;<span style='color:#9aa4ad'>"
+            f"(运行 {self._fmt_duration(sx)})</span>",
+            f"<span style='color:#9aa4ad'>光标: {y:.1f} ms</span>",
+        ]
+        for target, color, v in rows:
+            c = "#%02x%02x%02x" % color
+            val = ("<b style='color:#ff5050'>丢包</b>" if math.isnan(v)
+                   else f"<b>{v:.1f} ms</b>")
+            lines.append(f"<span style='color:{c}'>●</span> {target}&nbsp;{val}")
+        self.hover_text.setHtml(
+            "<div style='font-size: 9pt; color: #dddddd; white-space: nowrap'>"
+            + "<br/>".join(lines) + "</div>")
+
+        # 信息窗停靠方向：靠近右/下边缘时翻转锚点，保证始终在视野内
+        (x_lo, x_hi), (y_lo, y_hi) = vb.viewRange()
+        anchor_x = 0 if x < (x_lo + x_hi) / 2 else 1
+        anchor_y = 0 if y > (y_lo + y_hi) / 2 else 1
+        self.hover_text.setAnchor((anchor_x, anchor_y))
+
+        self.vline.setPos(sx)
+        self.hline.setPos(y)
+        self.hover_text.setPos(sx, y)
+        self._set_crosshair_visible(True)
+
     # ---------------- 周期刷新 ----------------
 
     def refresh_ui(self):
@@ -738,6 +837,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # 1) 取窗口数据 → 均值线 + min/max 包络降采样 → 一次性 setData
             ts, vs = info["buffer"].window(t_min)
+            # 缓存原始（未降采样）窗口数组，十字光标在其上二分查找，
+            # 避免每次鼠标移动都重新拼接环形缓冲
+            info["win_t"], info["win_v"] = ts, vs
             t_line, v_line, v_lo, v_hi, loss_t = envelope_series(
                 ts, vs, MAX_PLOT_POINTS)
             info["curve"].setData(t_line, v_line, connect="finite")
