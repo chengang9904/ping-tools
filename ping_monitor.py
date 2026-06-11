@@ -42,6 +42,12 @@ v3 新增
     自动翻转停靠方向。基于 refresh_ui 缓存的窗口数组做二分查找，
     鼠标事件处理为 O(log n)，不影响绘图性能。
 
+v4 新增
+-------
+13. 表格/图表高度可拖动：QSplitter 垂直分割，表格最小保留表头+1 行、
+    图表最小 200px，防止任一侧被拖没；分隔条位置防抖写入配置，
+    重启自动恢复。
+
 依赖安装
 --------
     pip install PyQt5 pyqtgraph
@@ -68,7 +74,7 @@ import pyqtgraph as pg
 
 # ============================ 全局配置 ============================
 
-DEFAULT_TARGETS = ["8.8.8.8", "114.114.114.114"]   # 首次运行/配置损坏时的默认目标
+DEFAULT_TARGETS = ["223.5.5.5", "114.114.114.114"]   # 首次运行/配置损坏时的默认目标
 PING_INTERVAL   = 1.0     # 每个目标的 Ping 周期（秒）
 PING_TIMEOUT_MS = 1000    # 单次 Ping 超时（毫秒），超时即记一次丢包
 REFRESH_MS      = 500     # UI 刷新周期（毫秒）：采集与绘制解耦的关键
@@ -104,39 +110,58 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "PingMonitor"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
-def load_targets() -> list:
-    """读取持久化的目标列表。文件缺失/损坏/为空时回退到默认列表，
+def read_config() -> dict:
+    """读取整个配置文件为 dict；缺失/损坏时返回空 dict，
     绝不让一个坏配置文件阻止程序启动。"""
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
             data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        print("[PingMonitor] 配置文件顶层不是对象，已忽略", file=sys.stderr)
+    except FileNotFoundError:
+        pass                               # 首次运行，正常情况
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[PingMonitor] 配置文件损坏，已忽略: {e}", file=sys.stderr)
+    return {}
+
+
+def save_config(**updates) -> None:
+    """读-改-写合并指定键后原子落盘（保留文件中的其他配置键）：
+    先写临时文件再 os.replace 替换，进程中途被杀也不会留下半截 JSON。
+    写失败只告警，不影响监控。"""
+    try:
+        cfg = read_config()
+        cfg.update(updates)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_FILE)
+    except OSError as e:
+        print(f"[PingMonitor] 配置保存失败: {e}", file=sys.stderr)
+
+
+def load_targets() -> list:
+    """读取持久化的目标列表，清洗（去空白/去重/保序）后返回；
+    为空或异常时回退到默认列表。"""
+    try:
         targets, seen = [], set()
-        for t in data.get("targets", []):
+        for t in read_config().get("targets", []):
             t = str(t).strip()
-            if t and t not in seen:        # 清洗：去空白、去重，保持顺序
+            if t and t not in seen:
                 seen.add(t)
                 targets.append(t)
         if targets:
             return targets
-    except FileNotFoundError:
-        pass                               # 首次运行，正常情况
-    except (json.JSONDecodeError, OSError, TypeError, AttributeError) as e:
-        print(f"[PingMonitor] 配置文件损坏，已回退默认目标: {e}", file=sys.stderr)
+    except (TypeError, AttributeError) as e:
+        print(f"[PingMonitor] targets 字段格式错误，已回退默认: {e}",
+              file=sys.stderr)
     return list(DEFAULT_TARGETS)
 
 
 def save_targets(targets) -> None:
-    """原子写回目标列表：先写临时文件再 os.replace 替换，
-    进程中途被杀也不会留下半截 JSON。写失败只告警，不影响监控。"""
-    try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = CONFIG_FILE.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"targets": list(targets)}, f,
-                      ensure_ascii=False, indent=2)
-        os.replace(tmp, CONFIG_FILE)
-    except OSError as e:
-        print(f"[PingMonitor] 配置保存失败: {e}", file=sys.stderr)
+    save_config(targets=list(targets))
 
 # ===================== Windows ICMP API 封装 =====================
 # IcmpSendEcho 是同步阻塞调用，但我们只在工作线程里调用它，不影响 UI。
@@ -457,6 +482,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._build_tray()
 
+        # 恢复上次的分隔条位置（base64 -> QByteArray）
+        state_b64 = read_config().get("splitter_state")
+        if isinstance(state_b64, str) and state_b64:
+            self.splitter.restoreState(
+                QtCore.QByteArray.fromBase64(state_b64.encode("ascii")))
+
         # 从用户目录配置加载目标列表（首次运行为默认列表）；
         # 加载阶段不回写配置，避免每次启动都碰磁盘
         self._loading_config = True
@@ -505,8 +536,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
-        self.table.setMaximumHeight(190)
-        layout.addWidget(self.table)
+        # 最小高度 = 表头 + 1 行数据 + 边框，防止被分隔条拖没
+        self.table.setMinimumHeight(
+            self.table.horizontalHeader().sizeHint().height()
+            + self.table.verticalHeader().defaultSectionSize()
+            + 2 * self.table.frameWidth())
 
         # 实时折线图
         pg.setConfigOptions(antialias=True)
@@ -518,7 +552,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.addLegend(offset=(10, 10))
         self.plot.setMouseEnabled(x=True, y=True)
         self.plot.enableAutoRange(axis="y")
-        layout.addWidget(self.plot, stretch=1)
+        self.plot.setMinimumHeight(200)
+
+        # 表格/图表用垂直分隔条组装：高度比例可拖动调整，
+        # 拖动停止 500ms 后将分隔条状态（base64）写入配置，重启恢复
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.splitter.addWidget(self.table)
+        self.splitter.addWidget(self.plot)
+        self.splitter.setStretchFactor(0, 0)   # 窗口缩放的增量空间优先给图表
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, False)
+        self.splitter.setSizes([190, 460])     # 无保存状态时的默认比例
+        layout.addWidget(self.splitter, stretch=1)
+
+        self._splitter_save_timer = QtCore.QTimer(self)
+        self._splitter_save_timer.setSingleShot(True)
+        self._splitter_save_timer.setInterval(500)
+        self._splitter_save_timer.timeout.connect(self._save_splitter_state)
+        self.splitter.splitterMoved.connect(
+            lambda *_: self._splitter_save_timer.start())  # 拖动中防抖
 
         # —— TradingView 风格十字光标 + 悬浮信息窗 ——
         cross_pen = pg.mkPen((168, 176, 184, 150), style=QtCore.Qt.DashLine)
@@ -911,8 +964,13 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(0, self._hide_to_tray)
         super().changeEvent(event)
 
+    def _save_splitter_state(self):
+        state = bytes(self.splitter.saveState().toBase64()).decode("ascii")
+        save_config(splitter_state=state)
+
     def closeEvent(self, event):
         # 关闭按钮 = 退出程序（最小化按钮仍是隐藏到托盘）
+        self._save_splitter_state()   # 防抖定时器可能尚未触发，退出前兜底
         self.refresh_timer.stop()
         for info in self.targets.values():
             self._stop_worker_obj(info)
