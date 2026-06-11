@@ -59,6 +59,10 @@ v4 新增
     手动浏览模式（停止自动跟随），"跟随最新"按钮或把视图拖回最右缘
     可恢复跟随；时间范围下拉框 = 跟随模式的窗口宽度。绘图与表格统计
     都只针对当前可见 X 范围计算。
+16. 图例交互：单击图例项切换该目标曲线显隐（标签置灰，表格行保留作
+    全量总览），双击 solo（只看这一条，再次双击恢复全部）；显隐状态
+    随 targets 持久化。图例半透明背景；表格"目标"列带曲线同色色块，
+    隐藏曲线后仍能对应目标与颜色。
 
 依赖安装
 --------
@@ -155,11 +159,11 @@ def save_config(**updates) -> None:
 
 
 def load_targets() -> list:
-    """读取持久化的目标列表，返回 [(host, alias), ...]。
+    """读取持久化的目标列表，返回 [(host, alias, visible), ...]。
 
     兼容两种格式（写回时统一为新版）：
-      旧版：纯字符串数组   ["8.8.8.8", ...]            -> alias 自动迁移为空
-      新版：对象数组       [{"host": "...", "alias": "..."}, ...]
+      旧版：纯字符串数组   ["8.8.8.8", ...]        -> alias 空 / visible True
+      新版：对象数组       [{"host", "alias", "visible"}, ...]
     清洗（去空白/按 host 去重/保序）；为空或异常时回退到默认列表。"""
     try:
         targets, seen = [], set()
@@ -167,17 +171,18 @@ def load_targets() -> list:
             if isinstance(entry, dict):
                 host = str(entry.get("host", "")).strip()
                 alias = str(entry.get("alias", "")).strip()
+                visible = bool(entry.get("visible", True))
             else:
-                host, alias = str(entry).strip(), ""   # 旧版纯字符串格式
+                host, alias, visible = str(entry).strip(), "", True  # 旧版
             if host and host not in seen:
                 seen.add(host)
-                targets.append((host, alias))
+                targets.append((host, alias, visible))
         if targets:
             return targets
     except (TypeError, AttributeError) as e:
         print(f"[PingMonitor] targets 字段格式错误，已回退默认: {e}",
               file=sys.stderr)
-    return [(h, "") for h in DEFAULT_TARGETS]
+    return [(h, "", True) for h in DEFAULT_TARGETS]
 
 # ===================== Windows ICMP API 封装 =====================
 # IcmpSendEcho 是同步阻塞调用，但我们只在工作线程里调用它，不影响 UI。
@@ -532,6 +537,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.range_secs = TIME_RANGES[0][1]
         self.follow = True            # True=X 轴自动跟随最新; False=手动浏览
         self._setting_range = False   # 程序触发 setXRange 的标志位
+        self._solo_host = None        # 双击图例的 solo 模式当前目标
         self._tray_tip_shown = False  # "已最小化到托盘"提示只弹一次
 
         self._build_ui()
@@ -546,8 +552,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # 从用户目录配置加载目标列表（首次运行为默认列表）；
         # 加载阶段不回写配置，避免每次启动都碰磁盘
         self._loading_config = True
-        for host, alias in load_targets():
-            self.add_target(host, alias)
+        for host, alias, visible in load_targets():
+            self.add_target(host, alias, visible)
         self._loading_config = False
 
         # UI 刷新定时器：采集（每秒/每目标 1 条）与绘制（每 500ms 一次）解耦
@@ -626,7 +632,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("left", "延迟", units="ms")
         self.plot.setLabel("bottom", "时间")
-        self.plot.addLegend(offset=(10, 10))
+        # 半透明图例：曲线从底下透出，遮挡感大减；点击/双击交互见
+        # _on_legend_click（单击显隐、双击 solo）
+        self.plot.addLegend(
+            offset=(10, 10),
+            brush=pg.mkBrush(16, 20, 24, 180),
+            pen=pg.mkPen(96, 105, 114, 120),
+            labelTextColor="#d4d8dc")
         # 鼠标只控制 X（平移/缩放）；Y 始终按可见数据自动适配，
         # 避免滚轮缩放后 Y 轴卡死在手动量程
         self.plot.setMouseEnabled(x=True, y=False)
@@ -728,7 +740,7 @@ class MainWindow(QtWidgets.QMainWindow):
         item = self.table.item(row, COL_TARGET)
         return item.data(QtCore.Qt.UserRole) if item else None
 
-    def add_target(self, target: str, alias: str = ""):
+    def add_target(self, target: str, alias: str = "", visible: bool = True):
         target = target.strip()
         if not target or target in self.targets:
             return
@@ -739,6 +751,23 @@ class MainWindow(QtWidgets.QMainWindow):
             [], [], pen=pg.mkPen(color=color, width=2),
             name=name, connect="finite",   # NaN 处断线，直观呈现丢包
         )
+        # 图例交互：单击显隐、双击 solo（pyqtgraph 的双击是带 double
+        # 标志的 click 事件，sample 与 label 都绑定同一处理器）
+        legend = self.plot.plotItem.legend
+        for sample, label in legend.items:
+            if sample.item is curve:
+                def on_click(ev, host=target):
+                    if ev.button() != QtCore.Qt.LeftButton:
+                        return
+                    ev.accept()
+                    if ev.double():
+                        self._solo_or_restore(host)
+                    else:
+                        self._solo_host = None
+                        self.toggle_target_visible(host)
+                sample.mouseClickEvent = on_click
+                label.mouseClickEvent = on_click
+                break
         # 包络阴影带：min-max 之间填充同色半透明——带宽即波动幅度，
         # 带子突然变宽 = 抖动发作。上下边界曲线本身不可见（pen=None）。
         band_lo = pg.PlotDataItem([], [], pen=None, connect="finite")
@@ -769,9 +798,13 @@ class MainWindow(QtWidgets.QMainWindow):
         target_item = self.table.item(row, COL_TARGET)
         target_item.setText(name)
         target_item.setData(QtCore.Qt.UserRole, target)  # 内部仍以 host 为键
+        swatch = QtGui.QPixmap(12, 12)                   # 曲线同色色块：
+        swatch.fill(QtGui.QColor(*color))                # 表格行 <-> 曲线对应
+        target_item.setData(QtCore.Qt.DecorationRole, swatch)
 
         info = {
             "alias": alias,
+            "visible": visible,
             "stats": TargetStats(),
             "buffer": RingBuffer(RING_CAPACITY),  # 24h 环形缓冲
             "curve": curve,
@@ -784,15 +817,64 @@ class MainWindow(QtWidgets.QMainWindow):
             "worker": None,
         }
         self.targets[target] = info
+        if not visible:
+            self._apply_visibility(target)   # 启动恢复"隐藏"状态
         if not self._loading_config:
             self._persist_targets()
         if self.running:
             self._start_worker(target)
 
+    # ---------------- 曲线显隐（图例交互） ----------------
+
+    def _legend_label(self, curve):
+        legend = self.plot.plotItem.legend
+        if legend is not None:
+            for sample, label in legend.items:
+                if sample.item is curve:
+                    return label
+        return None
+
+    def _update_legend_label(self, host: str):
+        """图例标签 = 展示名 + 显隐状态着色（隐藏置灰）。"""
+        info = self.targets[host]
+        label = self._legend_label(info["curve"])
+        if label is not None:
+            label.setText(self._display_name(host, info["alias"]),
+                          color="#d4d8dc" if info["visible"] else "#5a6066")
+
+    def _apply_visibility(self, host: str):
+        info = self.targets[host]
+        vis = info["visible"]
+        for key in ("curve", "band_lo", "band_hi", "band", "scatter"):
+            info[key].setVisible(vis)
+        self._update_legend_label(host)
+
+    def toggle_target_visible(self, host: str):
+        """单击图例：切换该目标曲线显隐（表格行保留，作全量状态总览）。"""
+        info = self.targets.get(host)
+        if info is None:
+            return
+        info["visible"] = not info["visible"]
+        self._apply_visibility(host)
+        if not self._loading_config:
+            self._persist_targets()
+
+    def _solo_or_restore(self, host: str):
+        """双击图例：solo 该目标（只显示它）；再次双击恢复全部显示。"""
+        if host not in self.targets:
+            return
+        restore = (self._solo_host == host)
+        self._solo_host = None if restore else host
+        for h, info in self.targets.items():
+            info["visible"] = True if restore else (h == host)
+            self._apply_visibility(h)
+        self._persist_targets()
+
     def _persist_targets(self):
-        """统一写回新版格式 [{"host", "alias"}]（dict 保持插入顺序）。"""
-        save_config(targets=[{"host": h, "alias": i["alias"]}
-                             for h, i in self.targets.items()])
+        """统一写回新版格式 [{"host","alias","visible"}]（保持插入顺序）。"""
+        save_config(targets=[
+            {"host": h, "alias": i["alias"], "visible": i["visible"]}
+            for h, i in self.targets.items()])
 
     def _start_worker(self, target: str):
         worker = PingWorker(target, PING_INTERVAL, PING_TIMEOUT_MS, parent=self)
@@ -805,6 +887,8 @@ class MainWindow(QtWidgets.QMainWindow):
         info = self.targets.pop(target, None)
         if info is None:
             return
+        if self._solo_host == target:
+            self._solo_host = None
         self._stop_worker_obj(info)
         self.plot.removeItem(info["curve"])
         self.plot.removeItem(info["band"])
@@ -913,12 +997,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._row_host(row) == host:
                 self.table.item(row, COL_TARGET).setText(name)
                 break
-        legend = self.plot.plotItem.legend             # 图例标签
-        if legend is not None:
-            for sample, label in legend.items:
-                if sample.item is info["curve"]:
-                    label.setText(name)
-                    break
+        self._update_legend_label(host)                # 图例标签（含显隐着色）
         info["curve"].opts["name"] = name
         self._persist_targets()
 
@@ -1003,6 +1082,8 @@ class MainWindow(QtWidgets.QMainWindow):
         snap_x = None
         rows = []
         for target, info in self.targets.items():
+            if not info["visible"]:
+                continue   # 隐藏的曲线不进悬浮窗
             wt, wv = info.get("win_t"), info.get("win_v")
             if wt is None or len(wt) == 0:
                 continue
@@ -1082,6 +1163,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # 缓存原始（未降采样）可见数组：十字光标二分查找 +
             # 选区统计共用，避免重复拼接环形缓冲
             info["win_t"], info["win_v"] = ts, vs
+            if not info["visible"]:
+                continue   # 隐藏目标：统计仍要数据，跳过绘图计算即可
             t_line, v_line, v_lo, v_hi, loss_flag = envelope_series(
                 ts, vs, MAX_PLOT_POINTS)
             info["curve"].setData(t_line, v_line, connect="finite")
