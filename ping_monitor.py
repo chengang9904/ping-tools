@@ -831,6 +831,15 @@ def main():
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
     app = QtWidgets.QApplication(sys.argv)
+    # 统一 UI 字体：Windows 中文环境下 Qt 默认字体常解析为宋体（SimSun），
+    # 小字号时中文走点阵渲染、缺字字符又按字符回退到雅黑等矢量字体，
+    # 中西文混排便呈现粗细不一。显式指定雅黑 UI（中西文同源、全部矢量
+    # 抗锯齿渲染），必须在创建任何窗口之前设置。
+    available = set(QtGui.QFontDatabase().families())
+    for family in ("Microsoft YaHei UI", "微软雅黑", "Microsoft YaHei"):
+        if family in available:
+            app.setFont(QtGui.QFont(family, 9))
+            break
     # 窗口隐藏到托盘后程序必须继续运行
     app.setQuitOnLastWindowClosed(False)
     win = MainWindow()
