@@ -34,6 +34,8 @@ v3 新增
 10. 均值±包络阴影带：降采样每桶顺便计算 min/mean/max——主线画均值，
     FillBetweenItem 在 min-max 之间填充半透明色。带子窄 = 稳定，
     带子突然变宽 = 抖动发作，扫一眼即可定位波动时段。
+11. 目标列表持久化：保存于 %APPDATA%\\PingMonitor\\config.json，
+    添加/移除目标即原子写回，重启自动恢复；配置损坏时回退默认列表。
 
 依赖安装
 --------
@@ -45,12 +47,15 @@ v3 新增
 """
 
 import sys
+import os
+import json
 import math
 import time
 import socket
 import struct
 import ctypes
 from ctypes import wintypes
+from pathlib import Path
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -58,7 +63,7 @@ import pyqtgraph as pg
 
 # ============================ 全局配置 ============================
 
-DEFAULT_TARGETS = ["8.8.8.8", "114.114.114.114"]   # 默认监控目标
+DEFAULT_TARGETS = ["8.8.8.8", "114.114.114.114"]   # 首次运行/配置损坏时的默认目标
 PING_INTERVAL   = 1.0     # 每个目标的 Ping 周期（秒）
 PING_TIMEOUT_MS = 1000    # 单次 Ping 超时（毫秒），超时即记一次丢包
 REFRESH_MS      = 500     # UI 刷新周期（毫秒）：采集与绘制解耦的关键
@@ -85,6 +90,48 @@ CURVE_COLORS = [
 ]
 
 _EMPTY = np.empty(0, dtype=np.float64)
+
+# ===================== 配置持久化（用户目录 JSON） =====================
+# 存放在 %APPDATA%\PingMonitor\config.json（漫游用户目录，重装系统盘外软件
+# 或多机漫游场景下可随用户配置迁移）；APPDATA 缺失时退回用户主目录。
+
+CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "PingMonitor"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+def load_targets() -> list:
+    """读取持久化的目标列表。文件缺失/损坏/为空时回退到默认列表，
+    绝不让一个坏配置文件阻止程序启动。"""
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        targets, seen = [], set()
+        for t in data.get("targets", []):
+            t = str(t).strip()
+            if t and t not in seen:        # 清洗：去空白、去重，保持顺序
+                seen.add(t)
+                targets.append(t)
+        if targets:
+            return targets
+    except FileNotFoundError:
+        pass                               # 首次运行，正常情况
+    except (json.JSONDecodeError, OSError, TypeError, AttributeError) as e:
+        print(f"[PingMonitor] 配置文件损坏，已回退默认目标: {e}", file=sys.stderr)
+    return list(DEFAULT_TARGETS)
+
+
+def save_targets(targets) -> None:
+    """原子写回目标列表：先写临时文件再 os.replace 替换，
+    进程中途被杀也不会留下半截 JSON。写失败只告警，不影响监控。"""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"targets": list(targets)}, f,
+                      ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_FILE)
+    except OSError as e:
+        print(f"[PingMonitor] 配置保存失败: {e}", file=sys.stderr)
 
 # ===================== Windows ICMP API 封装 =====================
 # IcmpSendEcho 是同步阻塞调用，但我们只在工作线程里调用它，不影响 UI。
@@ -405,8 +452,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._build_tray()
 
-        for t in DEFAULT_TARGETS:
+        # 从用户目录配置加载目标列表（首次运行为默认列表）；
+        # 加载阶段不回写配置，避免每次启动都碰磁盘
+        self._loading_config = True
+        for t in load_targets():
             self.add_target(t)
+        self._loading_config = False
 
         # UI 刷新定时器：采集（每秒/每目标 1 条）与绘制（每 500ms 一次）解耦
         self.refresh_timer = QtCore.QTimer(self)
@@ -562,6 +613,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "worker": None,
         }
         self.targets[target] = info
+        if not self._loading_config:
+            save_targets(self.targets.keys())   # dict 保持插入顺序
         if self.running:
             self._start_worker(target)
 
@@ -589,6 +642,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.table.item(row, COL_TARGET).text() == target:
                 self.table.removeRow(row)
                 break
+        save_targets(self.targets.keys())
 
     @staticmethod
     def _stop_worker_obj(info):
