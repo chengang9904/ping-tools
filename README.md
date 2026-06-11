@@ -29,6 +29,17 @@ pyinstaller -F -w --name PingMonitor ping_monitor.py
 # 产物：dist/PingMonitor.exe
 ```
 
+## 自动发布（GitHub Actions）
+
+推送 `v*` 标签即自动打包并创建 Release（附带 `PingMonitor-<tag>-win64.zip`）：
+
+```powershell
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+也可在 GitHub 的 Actions 页面手动触发 `Build and Release` 工作流，产物以构建 artifact 形式提供下载（不创建 Release）。
+
 ## 配置
 
 文件顶部配置区可调整：Ping 周期（`PING_INTERVAL`）、超时阈值（`PING_TIMEOUT_MS`）、

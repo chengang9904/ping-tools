@@ -1,0 +1,58 @@
+name: Build and Release
+
+on:
+  push:
+    tags: ["v*"]          # 推送 v1.1.0 这类标签 → 打包并发布 Release
+  workflow_dispatch:       # 也可在 Actions 页面手动触发（仅产出构建产物）
+
+permissions:
+  contents: write          # 创建 Release 需要写权限
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install PyQt5 pyqtgraph pyinstaller
+
+      - name: Build single-file exe
+        run: pyinstaller -F -w --name PingMonitor ping_monitor.py
+
+      # 冒烟测试：exe 必须能启动并存活 10 秒（启动即崩会让 HasExited 为真）
+      - name: Smoke test
+        run: |
+          $p = Start-Process dist\PingMonitor.exe -PassThru
+          Start-Sleep -Seconds 10
+          if ($p.HasExited) {
+            Write-Error "PingMonitor.exe exited prematurely (code $($p.ExitCode))"
+            exit 1
+          }
+          Stop-Process -Id $p.Id -Force
+
+      - name: Package zip
+        run: Compress-Archive -Path dist\PingMonitor.exe -DestinationPath "PingMonitor-${{ github.ref_name }}-win64.zip"
+
+      # 手动触发（非标签）时：把 zip 存为构建产物，供下载验证
+      - name: Upload build artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: PingMonitor-${{ github.ref_name }}-win64
+          path: PingMonitor-*.zip
+
+      # 标签触发时：创建 GitHub Release，自动生成更新日志并附上 zip
+      - name: Create GitHub Release
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PingMonitor-*.zip
+          generate_release_notes: true
