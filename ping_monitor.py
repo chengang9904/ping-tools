@@ -13,9 +13,9 @@ PingMonitor —— Windows 多目标实时 Ping 监控工具（单文件版 v2�
 
 v2 新增
 -------
-5. 系统托盘驻留：最小化/关闭均隐藏到托盘；托盘右键菜单（显示主界面 /
-   开始·暂停监控 / 退出程序）；双击托盘图标恢复主界面；
-   连续丢包达到阈值时弹出托盘气泡通知。
+5. 系统托盘驻留：最小化按钮隐藏到托盘（关闭按钮直接退出程序）；
+   托盘右键菜单（显示主界面 / 开始·暂停监控 / 退出程序）；
+   双击托盘图标恢复主界面；连续丢包达到阈值时弹出托盘气泡通知。
 6. 丢包可视化标记：每条曲线配一个 ScatterPlotItem，在图表顶部"丢包带"
    上以醒目的红色 X 标出每次丢包的时刻（不参与 Y 轴自动缩放，无反馈回路）。
 7. 时间范围切换：1分钟 / 5分钟 / 1小时 / 6小时 / 24小时。
@@ -446,7 +446,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_time = time.monotonic()
         self.running = True
         self.range_secs = TIME_RANGES[0][1]
-        self._really_quit = False     # 托盘退出菜单置位后，关闭才真正退出
         self._tray_tip_shown = False  # "已最小化到托盘"提示只弹一次
 
         self._build_ui()
@@ -548,9 +547,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.activateWindow()
 
     def quit_app(self):
-        self._really_quit = True
-        self.close()
-        QtWidgets.QApplication.quit()
+        self.close()   # closeEvent 统一负责清理与退出
 
     def _hide_to_tray(self):
         self.hide()
@@ -813,17 +810,15 @@ class MainWindow(QtWidgets.QMainWindow):
         super().changeEvent(event)
 
     def closeEvent(self, event):
-        # 点关闭按钮 → 隐藏到托盘；只有托盘菜单"退出程序"才真正退出
-        if self.tray is not None and not self._really_quit:
-            event.ignore()
-            self._hide_to_tray()
-            return
+        # 关闭按钮 = 退出程序（最小化按钮仍是隐藏到托盘）
         self.refresh_timer.stop()
         for info in self.targets.values():
             self._stop_worker_obj(info)
         if self.tray is not None:
             self.tray.hide()
         event.accept()
+        # quitOnLastWindowClosed 已关闭（托盘驻留需要），须显式退出事件循环
+        QtWidgets.QApplication.quit()
 
 
 def main():
