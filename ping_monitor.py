@@ -16,8 +16,10 @@ v2 新增
 5. 系统托盘驻留：最小化按钮隐藏到托盘（关闭按钮直接退出程序）；
    托盘右键菜单（显示主界面 / 开始·暂停监控 / 退出程序）；
    双击托盘图标恢复主界面；连续丢包达到阈值时弹出托盘气泡通知。
-6. 丢包可视化标记：每条曲线配一个 ScatterPlotItem，在图表顶部"丢包带"
-   上以醒目的红色 X 标出每次丢包的时刻（不参与 Y 轴自动缩放，无反馈回路）。
+6. 丢包可视化标记：连续丢包聚合为"丢包事件"，以目标同色的 ✕ 锚定在
+   该目标曲线的缺口处（相邻有效样本插值定位），事件越长标记越大
+   （对数缩放封顶）。颜色 + 位置双重归属目标，且不占用图表顶部空间；
+   选区内全程丢包、无锚点的目标退化到底部车道按行错开。
 7. 时间范围切换：1分钟 / 5分钟 / 1小时 / 6小时 / 24小时。
    底层为 numpy 预分配环形缓冲区（24h = 86400 点，O(1) 追加），
    展示长周期时按桶降采样，屏幕上恒定 ≤ MAX_PLOT_POINTS 个点，
@@ -352,25 +354,27 @@ class RingBuffer:
 
 
 def envelope_series(t: np.ndarray, v: np.ndarray, max_points: int):
-    """生成绘图序列：返回 (t_line, v_line, v_lo, v_hi, loss_t) 五元组。
+    """生成绘图序列：返回 (t_line, v_line, v_lo, v_hi, loss_flag) 五元组，
+    loss_flag 为与 t_line 对齐的布尔数组（该点/该桶是否发生过丢包）。
 
     点数 > max_points 时按桶聚合（降采样）：
       - v_line = 桶内均值（滚动均值线）
       - v_lo / v_hi = 桶内 min / max（包络阴影带的上下边界）
-      - 桶内只要出现过 NaN（丢包），该桶时刻就记入 loss_t（红 X 标记）
+      - 桶内只要出现过 NaN（丢包），该桶 loss_flag 为 True
       - 整桶全为 NaN 时输出 NaN，折线/包络在该处保持断开
     点数不多时：v_line = 原始数据，包络带用滑动窗口 min/max 计算，
       带宽依然直观反映短期波动。
     """
     n = len(t)
     if n == 0:
-        return t, v, v, v, _EMPTY
+        empty_flag = np.empty(0, dtype=bool)
+        return t, v, v, v, empty_flag
 
     if n <= max_points:                       # 不降采样：滑动窗口包络
-        loss_t = t[np.isnan(v)]
+        loss_flag = np.isnan(v)
         w = min(15, n)                        # 滑动窗口宽度（样本数）
         if w < 3:
-            return t, v, v, v, loss_t
+            return t, v, v, v, loss_flag
         win = np.lib.stride_tricks.sliding_window_view(v, w)
         valid = ~np.isnan(win)
         has = valid.any(axis=1)
@@ -382,7 +386,7 @@ def envelope_series(t: np.ndarray, v: np.ndarray, max_points: int):
         pad_r = w - 1 - pad_l
         v_lo = np.concatenate((np.full(pad_l, lo[0]), lo, np.full(pad_r, lo[-1])))
         v_hi = np.concatenate((np.full(pad_l, hi[0]), hi, np.full(pad_r, hi[-1])))
-        return t, v, v_lo, v_hi, loss_t
+        return t, v, v_lo, v_hi, loss_flag
 
     step = -(-n // max_points)                # 桶宽 = ceil(n / max_points)
     m = (n // step) * step
@@ -397,8 +401,51 @@ def envelope_series(t: np.ndarray, v: np.ndarray, max_points: int):
     v_lo = np.where(has, np.min(np.where(valid, v2, np.inf), axis=1), np.nan)
     v_hi = np.where(has, np.max(np.where(valid, v2, -np.inf), axis=1), np.nan)
     t_ds = t2[:, 0]
-    loss_t = t_ds[~valid.all(axis=1)]          # 桶内有任何丢包 → 标记
-    return t_ds, v_line, v_lo, v_hi, loss_t
+    loss_flag = ~valid.all(axis=1)             # 桶内有任何丢包 → 标记
+    return t_ds, v_line, v_lo, v_hi, loss_flag
+
+
+def loss_markers(t: np.ndarray, v: np.ndarray, loss_flag: np.ndarray):
+    """把连续丢包聚合为"丢包事件"标记，返回 (x, y, count) 三个数组。
+
+    - 每个事件一个标记（而非每个丢包点一个），x 取事件中点；
+      count 为事件覆盖的点/桶数，供调用方映射标记大小（越久越大）
+    - y 锚定在曲线缺口处：优先用事件内仍有效的 v_line（部分丢包桶），
+      否则取事件两侧相邻有效值的中值——标记贴着所属曲线，归属一目了然
+    - 事件周围完全无有效值（选区内该目标全程丢包）时 y 为 NaN，
+      由调用方放到图表底部车道
+    """
+    n = len(t)
+    if n == 0 or not loss_flag.any():
+        return _EMPTY, _EMPTY, _EMPTY
+    f = loss_flag.astype(np.int8)
+    d = np.diff(f)
+    starts = np.flatnonzero(d == 1) + 1
+    ends = np.flatnonzero(d == -1) + 1
+    if f[0]:
+        starts = np.concatenate(([0], starts))
+    if f[-1]:
+        ends = np.concatenate((ends, [n]))
+
+    xs, ys, counts = [], [], []
+    for s, e in zip(starts, ends):            # 事件数=故障次数，循环量极小
+        xs.append((t[s] + t[e - 1]) / 2.0)
+        seg_valid = v[s:e][~np.isnan(v[s:e])]
+        prev_v = v[s - 1] if s > 0 else math.nan
+        next_v = v[e] if e < n else math.nan
+        if seg_valid.size:                    # 部分丢包桶：线在此处仍有值
+            y = float(seg_valid.mean())
+        elif not math.isnan(prev_v) and not math.isnan(next_v):
+            y = (prev_v + next_v) / 2.0       # 缺口中点
+        elif not math.isnan(prev_v):
+            y = float(prev_v)
+        elif not math.isnan(next_v):
+            y = float(next_v)
+        else:
+            y = math.nan
+        ys.append(y)
+        counts.append(e - s)
+    return np.asarray(xs), np.asarray(ys), np.asarray(counts, dtype=float)
 
 
 # ========================= 统计模型 =========================
@@ -702,13 +749,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.addItem(band_lo)
         self.plot.addItem(band_hi)
         self.plot.addItem(band)
-        # 丢包标记：红色 X，挂在图表顶部"丢包带"上。
-        # ignoreBounds=True → 不参与 Y 轴自动缩放，避免"标记抬高量程→
-        # 标记位置又随量程上移"的正反馈循环。
+        # 丢包事件标记：目标同色 ✕，锚定在该目标曲线的缺口处——
+        # 颜色 + 位置双重归属，不再挤占图表顶部空间。
+        # ignoreBounds=True → 不参与 Y 轴自动缩放（底部车道回退时
+        # 标记位置依赖视野范围，避免反馈循环）。
         scatter = pg.ScatterPlotItem(
-            symbol="x", size=11, brush=None,
-            pen=pg.mkPen("#ff3030", width=2),
+            symbol="x", brush=None,
+            pen=pg.mkPen(color=color, width=2),
         )
+        scatter.setZValue(5)                 # 盖在曲线之上，缺口处清晰可见
         self.plot.plotItem.vb.addItem(scatter, ignoreBounds=True)
 
         row = self.table.rowCount()
@@ -1018,9 +1067,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """重绘当前可见 X 范围：取数 -> 包络降采样 -> setData。"""
         vb = self.plot.plotItem.vb
         x0, x1 = vb.viewRange()[0]
-        # 丢包标记画在当前视野顶部的"丢包带"上，多目标按行错开避免重叠
+        # 底部车道间距：仅用于"选区内全程丢包、无锚点"的退化场景
         y_lo, y_hi = vb.viewRange()[1]
-        band = (y_hi - y_lo) * 0.045 or 1.0
+        lane = (y_hi - y_lo) * 0.045 or 1.0
 
         for row in range(self.table.rowCount()):
             info = self.targets.get(self._row_host(row))
@@ -1033,15 +1082,23 @@ class MainWindow(QtWidgets.QMainWindow):
             # 缓存原始（未降采样）可见数组：十字光标二分查找 +
             # 选区统计共用，避免重复拼接环形缓冲
             info["win_t"], info["win_v"] = ts, vs
-            t_line, v_line, v_lo, v_hi, loss_t = envelope_series(
+            t_line, v_line, v_lo, v_hi, loss_flag = envelope_series(
                 ts, vs, MAX_PLOT_POINTS)
             info["curve"].setData(t_line, v_line, connect="finite")
             info["band_lo"].setData(t_line, v_lo, connect="finite")
             info["band_hi"].setData(t_line, v_hi, connect="finite")
-            if len(loss_t):
-                y_band = y_hi - band * (row + 1)
-                info["scatter"].setData(
-                    x=loss_t, y=np.full(loss_t.shape, y_band))
+
+            # 丢包事件标记：连续丢包聚合为单个 ✕，锚在曲线缺口处；
+            # 事件越长标记越大（对数增长，封顶），密度与噪声大幅下降
+            mx, my, mc = loss_markers(t_line, v_line, loss_flag)
+            if len(mx):
+                no_anchor = np.isnan(my)
+                if no_anchor.any():
+                    # 选区内该目标全程丢包：退化到底部车道，按行错开
+                    my = my.copy()
+                    my[no_anchor] = y_lo + lane * (row + 1)
+                sizes = np.clip(8 + 2 * np.log2(mc), 8, 16)
+                info["scatter"].setData(x=mx, y=my, size=sizes)
             else:
                 info["scatter"].setData(x=_EMPTY, y=_EMPTY)
 
