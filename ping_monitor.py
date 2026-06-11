@@ -47,6 +47,11 @@ v4 新增
 13. 表格/图表高度可拖动：QSplitter 垂直分割，表格最小保留表头+1 行、
     图表最小 200px，防止任一侧被拖没；分隔条位置防抖写入配置，
     重启自动恢复。
+14. 目标别名：双击表格行或右键菜单"设置别名"编辑；表格/图例/十字光标
+    悬浮窗统一显示"别名 (host)"，无别名只显示 host。内部仍以 host 为
+    键（表格行经 UserRole 关联），别名只影响展示层。config.json 的
+    targets 升级为 [{"host", "alias"}] 对象数组，兼容读取旧版纯字符串
+    格式并在写回时自动迁移。
 
 依赖安装
 --------
@@ -143,25 +148,29 @@ def save_config(**updates) -> None:
 
 
 def load_targets() -> list:
-    """读取持久化的目标列表，清洗（去空白/去重/保序）后返回；
-    为空或异常时回退到默认列表。"""
+    """读取持久化的目标列表，返回 [(host, alias), ...]。
+
+    兼容两种格式（写回时统一为新版）：
+      旧版：纯字符串数组   ["8.8.8.8", ...]            -> alias 自动迁移为空
+      新版：对象数组       [{"host": "...", "alias": "..."}, ...]
+    清洗（去空白/按 host 去重/保序）；为空或异常时回退到默认列表。"""
     try:
         targets, seen = [], set()
-        for t in read_config().get("targets", []):
-            t = str(t).strip()
-            if t and t not in seen:
-                seen.add(t)
-                targets.append(t)
+        for entry in read_config().get("targets", []):
+            if isinstance(entry, dict):
+                host = str(entry.get("host", "")).strip()
+                alias = str(entry.get("alias", "")).strip()
+            else:
+                host, alias = str(entry).strip(), ""   # 旧版纯字符串格式
+            if host and host not in seen:
+                seen.add(host)
+                targets.append((host, alias))
         if targets:
             return targets
     except (TypeError, AttributeError) as e:
         print(f"[PingMonitor] targets 字段格式错误，已回退默认: {e}",
               file=sys.stderr)
-    return list(DEFAULT_TARGETS)
-
-
-def save_targets(targets) -> None:
-    save_config(targets=list(targets))
+    return [(h, "") for h in DEFAULT_TARGETS]
 
 # ===================== Windows ICMP API 封装 =====================
 # IcmpSendEcho 是同步阻塞调用，但我们只在工作线程里调用它，不影响 UI。
@@ -491,8 +500,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # 从用户目录配置加载目标列表（首次运行为默认列表）；
         # 加载阶段不回写配置，避免每次启动都碰磁盘
         self._loading_config = True
-        for t in load_targets():
-            self.add_target(t)
+        for host, alias in load_targets():
+            self.add_target(host, alias)
         self._loading_config = False
 
         # UI 刷新定时器：采集（每秒/每目标 1 条）与绘制（每 500ms 一次）解耦
@@ -536,6 +545,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
+        # 别名编辑入口：双击行 / 右键菜单
+        self.table.itemDoubleClicked.connect(
+            lambda item: self._edit_alias(self._row_host(item.row())))
+        self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_menu)
         # 最小高度 = 表头 + 1 行数据 + 边框，防止被分隔条拖没
         self.table.setMinimumHeight(
             self.table.horizontalHeader().sizeHint().height()
@@ -638,15 +652,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------- 目标管理 ----------------
 
-    def add_target(self, target: str):
+    @staticmethod
+    def _display_name(host: str, alias: str) -> str:
+        """统一的展示名规则：有别名显示 '别名 (host)'，否则只显示 host。"""
+        return f"{alias} ({host})" if alias else host
+
+    def _row_host(self, row: int):
+        """表格行 -> host。host 存于 UserRole，COL_TARGET 文本是展示名。"""
+        item = self.table.item(row, COL_TARGET)
+        return item.data(QtCore.Qt.UserRole) if item else None
+
+    def add_target(self, target: str, alias: str = ""):
         target = target.strip()
         if not target or target in self.targets:
             return
 
+        name = self._display_name(target, alias)
         color = CURVE_COLORS[len(self.targets) % len(CURVE_COLORS)]
         curve = self.plot.plot(
             [], [], pen=pg.mkPen(color=color, width=2),
-            name=target, connect="finite",   # NaN 处断线，直观呈现丢包
+            name=name, connect="finite",   # NaN 处断线，直观呈现丢包
         )
         # 包络阴影带：min-max 之间填充同色半透明——带宽即波动幅度，
         # 带子突然变宽 = 抖动发作。上下边界曲线本身不可见（pen=None）。
@@ -673,9 +698,12 @@ class MainWindow(QtWidgets.QMainWindow):
             item = QtWidgets.QTableWidgetItem("-")
             item.setTextAlignment(QtCore.Qt.AlignCenter)
             self.table.setItem(row, col, item)
-        self.table.item(row, COL_TARGET).setText(target)
+        target_item = self.table.item(row, COL_TARGET)
+        target_item.setText(name)
+        target_item.setData(QtCore.Qt.UserRole, target)  # 内部仍以 host 为键
 
         info = {
+            "alias": alias,
             "stats": TargetStats(),
             "buffer": RingBuffer(RING_CAPACITY),  # 24h 环形缓冲
             "curve": curve,
@@ -689,9 +717,14 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         self.targets[target] = info
         if not self._loading_config:
-            save_targets(self.targets.keys())   # dict 保持插入顺序
+            self._persist_targets()
         if self.running:
             self._start_worker(target)
+
+    def _persist_targets(self):
+        """统一写回新版格式 [{"host", "alias"}]（dict 保持插入顺序）。"""
+        save_config(targets=[{"host": h, "alias": i["alias"]}
+                             for h, i in self.targets.items()])
 
     def _start_worker(self, target: str):
         worker = PingWorker(target, PING_INTERVAL, PING_TIMEOUT_MS, parent=self)
@@ -712,12 +745,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.plotItem.vb.removeItem(info["scatter"])
         legend = self.plot.plotItem.legend
         if legend is not None:
-            legend.removeItem(target)
+            legend.removeItem(info["curve"])   # 按对象移除，不受别名影响
         for row in range(self.table.rowCount()):
-            if self.table.item(row, COL_TARGET).text() == target:
+            if self._row_host(row) == target:
                 self.table.removeRow(row)
                 break
-        save_targets(self.targets.keys())
+        self._persist_targets()
 
     @staticmethod
     def _stop_worker_obj(info):
@@ -743,7 +776,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 and self.tray is not None):
             self.tray.showMessage(
                 "网络异常告警",
-                f"{target} 已连续丢包 {st.consec_loss} 次"
+                f"{self._display_name(target, info['alias'])} "
+                f"已连续丢包 {st.consec_loss} 次"
                 f"（累计丢包率 {st.loss_rate:.1f}%）",
                 QtWidgets.QSystemTrayIcon.Warning, 5000)
 
@@ -771,7 +805,52 @@ class MainWindow(QtWidgets.QMainWindow):
         row = self.table.currentRow()
         if row < 0:
             return
-        self.remove_target(self.table.item(row, COL_TARGET).text())
+        self.remove_target(self._row_host(row))
+
+    def _on_table_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        host = self._row_host(row) if row >= 0 else None
+        if host is None:
+            return
+        menu = QtWidgets.QMenu(self.table)
+        act_alias = menu.addAction("设置别名")
+        act_remove = menu.addAction("移除目标")
+        chosen = menu.exec_(self.table.viewport().mapToGlobal(pos))
+        if chosen is act_alias:
+            self._edit_alias(host)
+        elif chosen is act_remove:
+            self.remove_target(host)
+
+    def _edit_alias(self, host):
+        """弹窗编辑别名（_edit_alias 只管对话框，落地走 set_alias）。"""
+        info = self.targets.get(host)
+        if info is None:
+            return
+        alias, ok = QtWidgets.QInputDialog.getText(
+            self, "设置别名", f"{host} 的别名（留空清除）：",
+            text=info["alias"])
+        if ok:
+            self.set_alias(host, alias)
+
+    def set_alias(self, host: str, alias: str):
+        """更新别名并同步所有展示层（表格/图例），立即持久化。"""
+        info = self.targets.get(host)
+        if info is None:
+            return
+        info["alias"] = alias.strip()
+        name = self._display_name(host, info["alias"])
+        for row in range(self.table.rowCount()):       # 表格"目标"列
+            if self._row_host(row) == host:
+                self.table.item(row, COL_TARGET).setText(name)
+                break
+        legend = self.plot.plotItem.legend             # 图例标签
+        if legend is not None:
+            for sample, label in legend.items:
+                if sample.item is info["curve"]:
+                    label.setText(name)
+                    break
+        info["curve"].opts["name"] = name
+        self._persist_targets()
 
     def _on_range_changed(self, _index: int):
         self.range_secs = self.range_combo.currentData()
@@ -841,7 +920,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 i -= 1
             if snap_x is None:
                 snap_x = wt[i]            # 竖线吸附到最近采样时刻
-            rows.append((target, info["color"], wv[i]))
+            rows.append((self._display_name(target, info["alias"]),
+                         info["color"], wv[i]))
 
         sx = x if snap_x is None else snap_x
         wall = time.strftime("%H:%M:%S", time.localtime(self.wall_start + sx))
@@ -850,11 +930,11 @@ class MainWindow(QtWidgets.QMainWindow):
             f"(运行 {self._fmt_duration(sx)})</span>",
             f"<span style='color:#9aa4ad'>光标: {y:.1f} ms</span>",
         ]
-        for target, color, v in rows:
+        for name, color, v in rows:
             c = "#%02x%02x%02x" % color
             val = ("<b style='color:#ff5050'>丢包</b>" if math.isnan(v)
                    else f"<b>{v:.1f} ms</b>")
-            lines.append(f"<span style='color:{c}'>●</span> {target}&nbsp;{val}")
+            lines.append(f"<span style='color:{c}'>●</span> {name}&nbsp;{val}")
         self.hover_text.setHtml(
             "<div style='font-size: 9pt; color: #dddddd; white-space: nowrap'>"
             + "<br/>".join(lines) + "</div>")
@@ -883,7 +963,7 @@ class MainWindow(QtWidgets.QMainWindow):
         band = (y_hi - y_lo) * 0.045 or 1.0
 
         for row in range(self.table.rowCount()):
-            target = self.table.item(row, COL_TARGET).text()
+            target = self._row_host(row)
             info = self.targets.get(target)
             if info is None:
                 continue
