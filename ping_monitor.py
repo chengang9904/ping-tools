@@ -88,6 +88,7 @@ v5 性能优化
 import sys
 import os
 import json
+import collections
 import math
 import time
 import socket
@@ -111,6 +112,11 @@ HISTORY_SECONDS  = 24 * 3600                              # 保留 24 小时历�
 RING_CAPACITY    = int(HISTORY_SECONDS / PING_INTERVAL)   # 86400 点
 MAX_PLOT_POINTS  = 1500   # 屏幕上单条曲线最多绘制的点数（降采样目标）
 CONSEC_LOSS_ALERT = 3     # 连续丢包达到该次数 → 托盘气泡告警
+ALERT_RECOVERY_OK = 5     # DOWN 后连续成功该次数才判定恢复（迟滞）
+ALERT_WINDOW         = 20  # 劣化检测滑动窗口（包数）
+ALERT_DEGRADED_LOSS  = 5   # 窗口内丢包 ≥ 该值 → 链路劣化（非连续丢包）
+ALERT_DEGRADED_CLEAR = 2   # 窗口内丢包 ≤ 该值 → 劣化解除（迟滞）
+ALERT_COOLDOWN_S     = 300  # 同目标同类告警最小间隔（秒），抑制链路抖动刷屏
 STATS_DEBOUNCE_MS = 150   # 视图范围变化 -> 选区统计重算的防抖间隔
 
 # 时间范围选项（跟随模式下的窗口宽度）：(显示文本, 秒数)
@@ -514,6 +520,128 @@ class TargetStats:
     @property
     def loss_rate(self):
         return (self.lost / self.sent * 100.0) if self.sent else 0.0
+
+
+# ========================= 告警状态机 =========================
+
+AlertEvent = collections.namedtuple("AlertEvent", "kind host ts data")
+
+
+class _TargetAlertState:
+    """单目标告警状态。纯逻辑、显式传入时间戳，便于测试。
+
+    DOWN 进入/退出均带迟滞：连续丢包 CONSEC_LOSS_ALERT 次进入；
+    连续成功 ALERT_RECOVERY_OK 次才算恢复，期间零星成功不会重置告警。
+    """
+
+    __slots__ = ("consec_loss", "consec_ok", "down", "degraded",
+                 "outage_start", "first_ok_ts", "window")
+
+    def __init__(self):
+        self.consec_loss = 0
+        self.consec_ok = 0
+        self.down = False
+        self.degraded = False
+        self.outage_start = None   # 本次故障首个丢包时刻
+        self.first_ok_ts = None    # DOWN 期间当前成功连击的首个时刻
+        self.window = collections.deque(maxlen=ALERT_WINDOW)  # True=丢包
+
+    def update(self, ts: float, rtt):
+        events = []
+        self.window.append(rtt is None)
+        if rtt is None:
+            self.consec_loss += 1
+            self.consec_ok = 0
+            self.first_ok_ts = None
+            if not self.down:
+                if self.consec_loss == 1:
+                    self.outage_start = ts
+                if self.consec_loss >= CONSEC_LOSS_ALERT:
+                    self.down = True
+                    self.degraded = False   # 升级为 down，劣化态吸收
+                    events.append(AlertEvent("down", None, ts, {
+                        "window_loss": sum(self.window),
+                        "window_size": len(self.window)}))
+        else:
+            self.consec_loss = 0
+            self.consec_ok += 1
+            if self.down:
+                if self.consec_ok == 1:
+                    self.first_ok_ts = ts
+                if self.consec_ok >= ALERT_RECOVERY_OK:
+                    self.down = False
+                    duration = self.first_ok_ts - self.outage_start
+                    events.append(AlertEvent(
+                        "recovered", None, ts, {"duration": duration}))
+                    self.outage_start = self.first_ok_ts = None
+                    self.window.clear()   # 故障期丢包不再计入劣化窗口
+        window_loss = sum(self.window)
+        if not self.down:
+            if not self.degraded and window_loss >= ALERT_DEGRADED_LOSS:
+                self.degraded = True
+                events.append(AlertEvent("degraded", None, ts, {
+                    "window_loss": window_loss,
+                    "window_size": len(self.window)}))
+            elif self.degraded and window_loss <= ALERT_DEGRADED_CLEAR:
+                self.degraded = False
+                events.append(AlertEvent("degraded_recovered", None, ts, {}))
+        return events
+
+
+class AlertManager:
+    """所有目标的告警协调器：托盘只消费它产出的事件。
+
+    在状态机之上做两层过滤：
+    - 冷却：同目标同类告警 ALERT_COOLDOWN_S 内只播报一次（防抖动刷屏）；
+      被静默的 down/degraded，其配套恢复事件同样静默，避免无头恢复。
+    - 关联：全部目标同时 DOWN 时，把最后一个 down 升级为 all_down
+      （本机断网而非远端故障的信号）。
+    """
+
+    def __init__(self):
+        self._states = {}
+        self._last_alert = {}   # (host, kind) -> 上次播报时刻
+        self._announced = {}    # (host, kind) -> 上次进入该状态是否播报过
+
+    def add_target(self, host: str):
+        self._states[host] = _TargetAlertState()
+
+    def remove_target(self, host: str):
+        self._states.pop(host, None)
+        for d in (self._last_alert, self._announced):
+            for key in [k for k in d if k[0] == host]:
+                del d[key]
+
+    def _all_down(self):
+        return (len(self._states) >= 2
+                and all(s.down for s in self._states.values()))
+
+    def update(self, host: str, ts: float, rtt):
+        st = self._states.get(host)
+        if st is None:
+            return []
+        out = []
+        for ev in st.update(ts, rtt):
+            ev = ev._replace(host=host)
+            if ev.kind in ("down", "degraded"):
+                key = (host, ev.kind)
+                last = self._last_alert.get(key)
+                if last is not None and ts - last < ALERT_COOLDOWN_S:
+                    self._announced[key] = False
+                    continue
+                self._last_alert[key] = ts
+                self._announced[key] = True
+                if ev.kind == "down" and self._all_down():
+                    ev = AlertEvent("all_down", host, ts,
+                                    {"count": len(self._states)})
+            elif ev.kind == "recovered":
+                if not self._announced.get((host, "down"), True):
+                    continue
+            elif ev.kind == "degraded_recovered":
+                if not self._announced.get((host, "degraded"), True):
+                    continue
+            out.append(ev)
+        return out
 
 
 # ========================= 主窗口 =========================
