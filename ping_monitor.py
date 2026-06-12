@@ -609,8 +609,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # 状态表格
         self.table = QtWidgets.QTableWidget(0, len(TABLE_HEADERS))
         self.table.setHorizontalHeaderLabels(TABLE_HEADERS)
-        self.table.horizontalHeader().setSectionResizeMode(
-            QtWidgets.QHeaderView.Stretch)
+        # "目标"列内容最长（别名 + host + 色块）：按内容自适应宽度，
+        # 别名增删后自动重算；其余列均分剩余宽度
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_TARGET,
+                                    QtWidgets.QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
@@ -797,6 +801,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.table.setItem(row, col, item)
         target_item = self.table.item(row, COL_TARGET)
         target_item.setText(name)
+        target_item.setToolTip(name)   # 窗口极窄仍被省略时悬停可见全名
         target_item.setData(QtCore.Qt.UserRole, target)  # 内部仍以 host 为键
         swatch = QtGui.QPixmap(12, 12)                   # 曲线同色色块：
         swatch.fill(QtGui.QColor(*color))                # 表格行 <-> 曲线对应
@@ -995,7 +1000,9 @@ class MainWindow(QtWidgets.QMainWindow):
         name = self._display_name(host, info["alias"])
         for row in range(self.table.rowCount()):       # 表格"目标"列
             if self._row_host(row) == host:
-                self.table.item(row, COL_TARGET).setText(name)
+                item = self.table.item(row, COL_TARGET)
+                item.setText(name)
+                item.setToolTip(name)
                 break
         self._update_legend_label(host)                # 图例标签（含显隐着色）
         info["curve"].opts["name"] = name
