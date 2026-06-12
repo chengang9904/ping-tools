@@ -497,24 +497,21 @@ class TargetStats:
     X 范围的环形缓冲数据现算（选区统计），此处只保留全程汇总。
     """
 
-    __slots__ = ("sent", "lost", "recv", "last", "consec_loss")
+    __slots__ = ("sent", "lost", "recv", "last")
 
     def __init__(self):
         self.sent = 0
         self.lost = 0
         self.recv = 0
         self.last = None        # 最近一次 RTT；None 表示最近一次超时
-        self.consec_loss = 0    # 当前连续丢包次数（用于托盘告警）
 
     def update(self, rtt):
         self.sent += 1
         if rtt is None:
             self.lost += 1
-            self.consec_loss += 1
             self.last = None
         else:
             self.recv += 1
-            self.consec_loss = 0
             self.last = rtt
 
     @property
@@ -525,6 +522,16 @@ class TargetStats:
 # ========================= 告警状态机 =========================
 
 AlertEvent = collections.namedtuple("AlertEvent", "kind host ts data")
+
+
+def format_duration(secs: float) -> str:
+    """秒数 -> 人类可读时长（告警气泡用）。"""
+    secs = int(secs)
+    if secs >= 3600:
+        return f"{secs // 3600} 小时 {secs % 3600 // 60} 分"
+    if secs >= 60:
+        return f"{secs // 60} 分 {secs % 60} 秒"
+    return f"{secs} 秒"
 
 
 class _TargetAlertState:
@@ -687,6 +694,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # target -> {worker, stats, buffer, curve, scatter, color, error}
         self.targets = {}
+        self.alerts = AlertManager()   # 告警状态机：托盘气泡只消费其事件
         self.start_time = time.monotonic()
         self.wall_start = time.time()   # 运行秒数 -> 墙钟时间的换算基准
         self.running = True
@@ -990,6 +998,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "worker": None,
         }
         self.targets[target] = info
+        self.alerts.add_target(target)
         if not visible:
             self._apply_visibility(target)   # 启动恢复"隐藏"状态
         if not self._loading_config:
@@ -1062,6 +1071,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self._solo_host == target:
             self._solo_host = None
+        self.alerts.remove_target(target)
         self._stop_worker_obj(info)
         self.plot.removeItem(info["curve"])
         self.plot.removeItem(info["band"])
@@ -1098,15 +1108,37 @@ class MainWindow(QtWidgets.QMainWindow):
         wall_ts = self.wall_start + (ts - self.start_time)
         info["buffer"].append(wall_ts, rtt if rtt is not None else math.nan)
 
-        # 连续丢包恰好达到阈值时告警一次；恢复后 consec 归零，可再次触发
-        if (rtt is None and st.consec_loss == CONSEC_LOSS_ALERT
-                and self.tray is not None):
-            self.tray.showMessage(
-                "网络异常告警",
-                f"{self._display_name(target, info['alias'])} "
-                f"已连续丢包 {st.consec_loss} 次"
-                f"（累计丢包率 {st.loss_rate:.1f}%）",
-                QtWidgets.QSystemTrayIcon.Warning, 5000)
+        # 告警判定全部交给状态机（迟滞/劣化/冷却/全断关联），这里只播报
+        for ev in self.alerts.update(target, wall_ts, rtt):
+            self._show_alert(ev, info["alias"])
+
+    def _show_alert(self, ev: AlertEvent, alias: str):
+        if self.tray is None:
+            return
+        name = self._display_name(ev.host, alias)
+        Icon = QtWidgets.QSystemTrayIcon
+        if ev.kind == "down":
+            title, icon = "网络异常告警", Icon.Warning
+            msg = (f"{name} 持续无响应（近 {ev.data['window_size']} 次探测"
+                   f"丢包 {ev.data['window_loss']} 次）")
+        elif ev.kind == "all_down":
+            title, icon = "本机网络中断", Icon.Critical
+            msg = (f"全部 {ev.data['count']} 个目标同时无响应，"
+                   f"疑似本地网络或网关故障")
+        elif ev.kind == "recovered":
+            title, icon = "网络已恢复", Icon.Information
+            msg = (f"{name} 已恢复响应"
+                   f"（故障持续 {format_duration(ev.data['duration'])}）")
+        elif ev.kind == "degraded":
+            title, icon = "链路质量劣化", Icon.Warning
+            msg = (f"{name} 近 {ev.data['window_size']} 次探测"
+                   f"丢包 {ev.data['window_loss']} 次")
+        elif ev.kind == "degraded_recovered":
+            title, icon = "链路质量恢复", Icon.Information
+            msg = f"{name} 丢包已回落至正常水平"
+        else:
+            return
+        self.tray.showMessage(title, msg, icon, 5000)
 
     def _on_error(self, target: str, msg: str):
         info = self.targets.get(target)

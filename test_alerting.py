@@ -4,7 +4,7 @@
 """
 import unittest
 
-from ping_monitor import AlertManager
+from ping_monitor import AlertManager, format_duration
 
 
 def feed(mgr, host, t0, pattern, interval=1.0):
@@ -119,6 +119,17 @@ class TestCooldownAndCorrelation(unittest.TestCase):
         feed(self.mgr, "b", 0.0, "ooo")          # b 正常
         ev_a = feed(self.mgr, "a", 0.0, "xxx")   # 仅 a 故障
         self.assertEqual([e.kind for e in ev_a], ["down"])
+
+
+class TestFormatDuration(unittest.TestCase):
+    def test_seconds(self):
+        self.assertEqual(format_duration(42.4), "42 秒")
+
+    def test_minutes(self):
+        self.assertEqual(format_duration(125), "2 分 5 秒")
+
+    def test_hours(self):
+        self.assertEqual(format_duration(3660), "1 小时 1 分")
 
 
 if __name__ == "__main__":
