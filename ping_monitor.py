@@ -63,6 +63,8 @@ v4 新增
     全量总览），双击 solo（只看这一条，再次双击恢复全部）；显隐状态
     随 targets 持久化。图例半透明背景；表格"目标"列带曲线同色色块，
     隐藏曲线后仍能对应目标与颜色。
+17. 目标排序：右键菜单"上移/下移"或 Alt+↑/↓ 调整行顺序，顺序随
+    targets 持久化（决定持久化与绘制次序）。
 
 v5 性能优化
 -----------
@@ -787,6 +789,13 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda item: self._edit_alias(self._row_host(item.row())))
         self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_menu)
+        # Alt+↑/↓ 移动当前选中行（右键菜单也提供"上移/下移"）
+        up = QtWidgets.QShortcut(QtGui.QKeySequence("Alt+Up"), self.table)
+        up.setContext(QtCore.Qt.WidgetShortcut)
+        up.activated.connect(lambda: self._move_selected(-1))
+        down = QtWidgets.QShortcut(QtGui.QKeySequence("Alt+Down"), self.table)
+        down.setContext(QtCore.Qt.WidgetShortcut)
+        down.activated.connect(lambda: self._move_selected(1))
         # 最小高度 = 表头 + 1 行数据 + 边框，防止被分隔条拖没
         self.table.setMinimumHeight(
             self.table.horizontalHeader().sizeHint().height()
@@ -1173,12 +1182,54 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         menu = QtWidgets.QMenu(self.table)
         act_alias = menu.addAction("设置别名")
+        menu.addSeparator()
+        act_up = menu.addAction("上移")
+        act_up.setEnabled(row > 0)                       # 首行不能上移
+        act_down = menu.addAction("下移")
+        act_down.setEnabled(row < self.table.rowCount() - 1)  # 末行不能下移
+        menu.addSeparator()
         act_remove = menu.addAction("移除目标")
         chosen = menu.exec_(self.table.viewport().mapToGlobal(pos))
         if chosen is act_alias:
             self._edit_alias(host)
+        elif chosen is act_up:
+            self.move_target(host, -1)
+        elif chosen is act_down:
+            self.move_target(host, 1)
         elif chosen is act_remove:
             self.remove_target(host)
+
+    def move_target(self, host: str, delta: int):
+        """上移/下移目标一行（delta=-1/+1）。同步交换表格行、重排
+        self.targets 顺序（决定持久化与绘制顺序），并落盘。"""
+        row = next((r for r in range(self.table.rowCount())
+                    if self._row_host(r) == host), None)
+        if row is None:
+            return
+        new_row = row + delta
+        if not (0 <= new_row < self.table.rowCount()):
+            return
+        # 整行交换：takeItem 保留 item 的全部数据（文本/色块/UserRole/
+        # tooltip/前景色），再换位 setItem
+        for col in range(self.table.columnCount()):
+            a = self.table.takeItem(row, col)
+            b = self.table.takeItem(new_row, col)
+            self.table.setItem(row, col, b)
+            self.table.setItem(new_row, col, a)
+        # 按新的表格行序重建 targets 字典（颜色等随 info 一起搬，不变）
+        self.targets = {self._row_host(r): self.targets[self._row_host(r)]
+                        for r in range(self.table.rowCount())}
+        self.table.selectRow(new_row)
+        self._persist_targets()
+        self.refresh_ui()   # 行号变了 -> 刷新统计单元格与底部丢包车道
+
+    def _move_selected(self, delta: int):
+        """Alt+↑/↓ 快捷键：移动当前选中行。"""
+        row = self.table.currentRow()
+        if row >= 0:
+            host = self._row_host(row)
+            if host is not None:
+                self.move_target(host, delta)
 
     def _edit_alias(self, host):
         """弹窗编辑别名（_edit_alias 只管对话框，落地走 set_alias）。"""
