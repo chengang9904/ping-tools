@@ -65,6 +65,9 @@ v4 新增
     隐藏曲线后仍能对应目标与颜色。
 17. 目标排序：右键菜单"上移/下移"或 Alt+↑/↓ 调整行顺序，顺序随
     targets 持久化（决定持久化与绘制次序）。
+18. 桌面通知开关：工具栏"桌面通知"复选框与托盘右键菜单同名项联动，
+    关闭后告警/恢复/目标错误均不再弹出托盘气泡（采集与图表照常运行）；
+    开关状态以 notify_enabled 持久化到 config.json，重启自动恢复。
 
 v5 性能优化
 -----------
@@ -705,6 +708,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setting_range = False   # 程序触发 setXRange 的标志位
         self._solo_host = None        # 双击图例的 solo 模式当前目标
         self._tray_tip_shown = False  # "已最小化到托盘"提示只弹一次
+        # 桌面通知总开关：关闭后不再弹出告警/错误托盘气泡（采集与图表照常）；
+        # 工具栏复选框与托盘菜单项共同控制，状态持久化到 config.json
+        self.notify_enabled = bool(read_config().get("notify_enabled", True))
 
         self._build_ui()
         self._build_tray()
@@ -770,6 +776,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_follow.clicked.connect(self._on_follow_clicked)
         bar.addWidget(self.btn_follow)
         bar.addStretch(1)
+        # 桌面通知开关：勾选先于连接信号设置，避免构建期误触发持久化写盘
+        self.chk_notify = QtWidgets.QCheckBox("桌面通知")
+        self.chk_notify.setToolTip("关闭后，链路异常/恢复与目标错误不再弹出托盘气泡")
+        self.chk_notify.setChecked(self.notify_enabled)
+        self.chk_notify.toggled.connect(self._on_notify_toggled)
+        bar.addWidget(self.chk_notify)
         layout.addLayout(bar)
 
         # 状态表格
@@ -880,6 +892,10 @@ class MainWindow(QtWidgets.QMainWindow):
         act_show.triggered.connect(self.restore_window)
         self.act_pause = menu.addAction("暂停监控")
         self.act_pause.triggered.connect(self.toggle_running)
+        self.act_notify = menu.addAction("桌面通知")
+        self.act_notify.setCheckable(True)
+        self.act_notify.setChecked(self.notify_enabled)
+        self.act_notify.toggled.connect(self._on_notify_toggled)
         menu.addSeparator()
         act_quit = menu.addAction("退出程序")
         act_quit.triggered.connect(self.quit_app)
@@ -1122,7 +1138,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_alert(ev, info["alias"])
 
     def _show_alert(self, ev: AlertEvent, alias: str):
-        if self.tray is None:
+        if self.tray is None or not self.notify_enabled:
             return
         name = self._display_name(ev.host, alias)
         Icon = QtWidgets.QSystemTrayIcon
@@ -1154,7 +1170,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if info is None:
             return
         info["error"] = msg
-        if self.tray is not None:
+        if self.tray is not None and self.notify_enabled:
             self.tray.showMessage("目标错误", f"{target}: {msg}",
                                   QtWidgets.QSystemTrayIcon.Warning, 5000)
 
@@ -1304,6 +1320,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tray.setToolTip(
                 "PingMonitor - 网络监控运行中" if self.running
                 else "PingMonitor - 监控已暂停")
+
+    def _on_notify_toggled(self, enabled: bool):
+        """桌面通知总开关——工具栏复选框与托盘菜单项共用。
+        blockSignals 同步另一个控件，避免回环触发与重复落盘。"""
+        if enabled == self.notify_enabled:
+            return                       # 同步另一控件时已是目标状态，直接返回
+        self.notify_enabled = enabled
+        for w in (self.chk_notify, getattr(self, "act_notify", None)):
+            if w is not None and w.isChecked() != enabled:
+                w.blockSignals(True)
+                w.setChecked(enabled)
+                w.blockSignals(False)
+        save_config(notify_enabled=enabled)
 
     # ---------------- 十字光标 + 悬浮信息窗 ----------------
 
