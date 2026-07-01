@@ -68,6 +68,9 @@ v4 新增
 18. 桌面通知开关：工具栏"桌面通知"复选框与托盘右键菜单同名项联动，
     关闭后告警/恢复/目标错误均不再弹出托盘气泡（采集与图表照常运行）；
     开关状态以 notify_enabled 持久化到 config.json，重启自动恢复。
+19. 表格首列"显示"复选框：直接在目标列表里勾选/取消该目标是否绘入
+    图表，与图例单击显隐、双击 solo 双向同步；显隐状态随 targets 持久化
+    （隐藏的目标仍参与表格统计，只是不占用图表）。
 
 v5 性能优化
 -----------
@@ -658,12 +661,12 @@ class AlertManager:
 
 # ========================= 主窗口 =========================
 
-COL_TARGET, COL_STATUS, COL_CUR, COL_LOSS, \
-    COL_P50, COL_P95, COL_JITTER, COL_TOTAL = range(8)
+COL_SHOW, COL_TARGET, COL_STATUS, COL_CUR, COL_LOSS, \
+    COL_P50, COL_P95, COL_JITTER, COL_TOTAL = range(9)
 
-# 丢包率/P50/P95/抖动均按图表当前可见 X 范围（选区）现算；
-# 全程汇总后置到最后一列
-TABLE_HEADERS = ["目标", "状态", "当前(ms)", "丢包率(选区)",
+# 首列为显隐复选框（勾选=在图表中显示该目标）；
+# 丢包率/P50/P95/抖动均按图表当前可见 X 范围（选区）现算，全程汇总后置最后一列
+TABLE_HEADERS = ["显示", "目标", "状态", "当前(ms)", "丢包率(选区)",
                  "P50(选区)", "P95(选区)", "抖动(选区)", "累计 发送/丢失"]
 
 
@@ -711,6 +714,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # 桌面通知总开关：关闭后不再弹出告警/错误托盘气泡（采集与图表照常）；
         # 工具栏复选框与托盘菜单项共同控制，状态持久化到 config.json
         self.notify_enabled = bool(read_config().get("notify_enabled", True))
+        # 程序自身改动表格（构建行/刷新统计/交换行/同步复选框）时置位，
+        # 令 itemChanged 处理器只响应用户对首列复选框的真实勾选
+        self._suppress_item_signal = False
 
         self._build_ui()
         self._build_tray()
@@ -793,12 +799,15 @@ class MainWindow(QtWidgets.QMainWindow):
         header.setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(COL_TARGET,
                                     QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_SHOW,           # 复选框列只需容下勾选框
+                                    QtWidgets.QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
-        # 别名编辑入口：双击行 / 右键菜单
-        self.table.itemDoubleClicked.connect(
-            lambda item: self._edit_alias(self._row_host(item.row())))
+        # 别名编辑入口：双击行 / 右键菜单（首列复选框除外，避免双击误编辑）
+        self.table.itemDoubleClicked.connect(self._on_item_double_clicked)
+        # 首列复选框勾选/取消 → 切换该目标在图表中的显隐
+        self.table.itemChanged.connect(self._on_item_changed)
         self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_menu)
         # Alt+↑/↓ 移动当前选中行（右键菜单也提供"上移/下移"）
@@ -996,6 +1005,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         row = self.table.rowCount()
         self.table.insertRow(row)
+        # 构建期程序性写单元格：抑制 itemChanged，避免误判为用户勾选
+        self._suppress_item_signal = True
         for col in range(len(TABLE_HEADERS)):
             item = QtWidgets.QTableWidgetItem("-")
             item.setTextAlignment(QtCore.Qt.AlignCenter)
@@ -1007,6 +1018,15 @@ class MainWindow(QtWidgets.QMainWindow):
         swatch = QtGui.QPixmap(12, 12)                   # 曲线同色色块：
         swatch.fill(QtGui.QColor(*color))                # 表格行 <-> 曲线对应
         target_item.setData(QtCore.Qt.DecorationRole, swatch)
+        # 首列复选框：勾选=在图表中显示（与单击图例等效，状态随 targets 持久化）
+        show_item = self.table.item(row, COL_SHOW)
+        show_item.setText("")
+        show_item.setFlags((show_item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                           & ~QtCore.Qt.ItemIsEditable)
+        show_item.setCheckState(
+            QtCore.Qt.Checked if visible else QtCore.Qt.Unchecked)
+        show_item.setToolTip("勾选=在图表中显示该目标")
+        self._suppress_item_signal = False
 
         info = {
             "alias": alias,
@@ -1055,6 +1075,47 @@ class MainWindow(QtWidgets.QMainWindow):
         for key in ("curve", "band_lo", "band_hi", "band", "scatter"):
             info[key].setVisible(vis)
         self._update_legend_label(host)
+        self._sync_show_checkbox(host)   # 表格首列复选框跟随图例单击/双击 solo
+
+    def _sync_show_checkbox(self, host: str):
+        """把 info['visible'] 反映到表格首列复选框（非用户直接勾选的路径调用）。
+        抑制 itemChanged，避免与 _on_item_changed 形成回环。"""
+        info = self.targets.get(host)
+        if info is None:
+            return
+        state = QtCore.Qt.Checked if info["visible"] else QtCore.Qt.Unchecked
+        for row in range(self.table.rowCount()):
+            if self._row_host(row) == host:
+                item = self.table.item(row, COL_SHOW)
+                if item is not None and item.checkState() != state:
+                    self._suppress_item_signal = True
+                    item.setCheckState(state)
+                    self._suppress_item_signal = False
+                break
+
+    def _on_item_double_clicked(self, item):
+        """双击表格：编辑别名；首列复选框除外（避免双击既切显隐又弹别名框）。"""
+        if item.column() == COL_SHOW:
+            return
+        self._edit_alias(self._row_host(item.row()))
+
+    def _on_item_changed(self, item):
+        """首列复选框被用户勾选/取消 → 切换该目标在图表中的显隐。
+        程序自身的表格改动经 _suppress_item_signal 或列过滤跳过，不误触发。"""
+        if self._suppress_item_signal or item.column() != COL_SHOW:
+            return
+        host = self._row_host(item.row())
+        info = self.targets.get(host) if host else None
+        if info is None:
+            return
+        want = (item.checkState() == QtCore.Qt.Checked)
+        if info["visible"] == want:
+            return
+        self._solo_host = None            # 手动勾选退出 solo（与单击图例一致）
+        info["visible"] = want
+        self._apply_visibility(host)
+        if not self._loading_config:
+            self._persist_targets()
 
     def toggle_target_visible(self, host: str):
         """单击图例：切换该目标曲线显隐（表格行保留，作全量状态总览）。"""
@@ -1226,12 +1287,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if not (0 <= new_row < self.table.rowCount()):
             return
         # 整行交换：takeItem 保留 item 的全部数据（文本/色块/UserRole/
-        # tooltip/前景色），再换位 setItem
+        # tooltip/前景色/复选状态），再换位 setItem。交换途中 COL_TARGET
+        # 尚未与 COL_SHOW 同步就位，须抑制 itemChanged 以免误判勾选
+        self._suppress_item_signal = True
         for col in range(self.table.columnCount()):
             a = self.table.takeItem(row, col)
             b = self.table.takeItem(new_row, col)
             self.table.setItem(row, col, b)
             self.table.setItem(new_row, col, a)
+        self._suppress_item_signal = False
         # 按新的表格行序重建 targets 字典（颜色等随 info 一起搬，不变）
         self.targets = {self._row_host(r): self.targets[self._row_host(r)]
                         for r in range(self.table.rowCount())}
